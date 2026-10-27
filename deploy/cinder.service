@@ -1,0 +1,39 @@
+[Unit]
+Description=Cinder private file drop
+Documentation=file:///opt/cinder/README.md
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=cinder
+Group=cinder
+WorkingDirectory=/opt/cinder
+EnvironmentFile=/opt/cinder/.env
+ExecStart=/usr/bin/node .output/server/index.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening. The process only needs to read the app tree and talk to Postgres.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/opt/cinder
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# File descriptors and restart behaviour
+LimitNOFILE=65535
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
