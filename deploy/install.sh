@@ -450,10 +450,20 @@ sed \
   -e "s|^ReadWritePaths=.*|ReadWritePaths=${PREFIX}|" \
   -e "s|^Documentation=.*|Documentation=file://${PREFIX}/README.md|" \
   "$PREFIX/deploy/cinder.service" > /etc/systemd/system/cinder.service
+sed \
+  -e "s|^WorkingDirectory=.*|WorkingDirectory=${PREFIX}|" \
+  -e "s|^EnvironmentFile=.*|EnvironmentFile=${PREFIX}/.env|" \
+  -e "s|^ExecStart=.*|ExecStart=${NODE_BIN} scripts/expire.mjs|" \
+  -e "s|^Documentation=.*|Documentation=file://${PREFIX}/README.md|" \
+  "$PREFIX/deploy/cinder-expire.service" > /etc/systemd/system/cinder-expire.service
+cp "$PREFIX/deploy/cinder-expire.timer" /etc/systemd/system/cinder-expire.timer
 systemctl daemon-reload
 systemctl enable cinder
+systemctl enable cinder-expire.timer
 systemctl reset-failed cinder || true
 systemctl restart cinder
+systemctl restart cinder-expire.timer
+systemctl start cinder-expire.service || die "Could not delete expired seals. Check: journalctl -u cinder-expire.service"
 
 app_up=0
 for _ in $(seq 1 30); do

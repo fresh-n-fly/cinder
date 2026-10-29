@@ -18,7 +18,7 @@ import {
 } from "@/lib/constants";
 import { chunkCountFor } from "@/lib/files";
 import { getSql, type Sql } from "@/lib/db";
-import { SECRET_TABLES, wipeAbandonedUploads, wipeBatch, wipeFile, wipeUpload } from "../../scripts/wipe.mjs";
+import { SECRET_TABLES, wipeBatch, wipeDue, wipeFile, wipeUpload } from "../../scripts/wipe.mjs";
 
 export type BatchMeta = {
   id: string;
@@ -169,35 +169,12 @@ async function vacuumTables(sql: Sql, tables: readonly string[]): Promise<void> 
 
 export async function purgeExpired(): Promise<void> {
   const sql = await getSql();
-  const query = asQuery(sql);
-  const uploads = await wipeAbandonedUploads(query);
+  const due = await wipeDue(asQuery(sql));
   const tables: string[] = [];
-  if (uploads > 0) tables.push("upload_chunks");
-
-  const batches = await sql<{ id: string }>`
-    select id from sealed_batches
-    where expires_at <= now()
-       or (
-         download_count >= max_downloads
-         and (grant_expires_at is null or grant_expires_at <= now())
-       )
-    limit 50
-  `;
-  let seals = 0;
-  for (const row of batches) {
-    seals += await wipeBatch(query, row.id);
+  if (due.uploads > 0) tables.push("upload_chunks");
+  if (due.batches > 0 || due.legacy > 0) {
+    tables.push("sealed_file_chunks", "sealed_files", "sealed_batches");
   }
-
-  const legacy = await sql<{ id: string }>`
-    select id from sealed_files
-    where batch_id is null
-      and (expires_at <= now() or download_count >= max_downloads)
-    limit 50
-  `;
-  for (const row of legacy) {
-    seals += await wipeFile(query, row.id);
-  }
-  if (seals > 0) tables.push("sealed_file_chunks", "sealed_files", "sealed_batches");
   if (tables.length > 0) await vacuumTables(sql, tables);
 }
 

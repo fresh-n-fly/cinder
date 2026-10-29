@@ -173,6 +173,42 @@ export async function wipeUpload(query, uploadId) {
   return removed;
 }
 
+const DUE_BATCHES = `
+  select id from sealed_batches
+  where expires_at <= now()
+     or (
+       download_count >= max_downloads
+       and (grant_expires_at is null or grant_expires_at <= now())
+     )
+  order by expires_at
+`;
+
+const DUE_LEGACY = `
+  select id from sealed_files
+  where batch_id is null
+    and (expires_at <= now() or download_count >= max_downloads)
+  order by expires_at
+`;
+
+/**
+ * Delete every abandoned upload, expired seal, and used-up seal.
+ * A used-up seal stays until its download ticket has ended.
+ * @param {Query} query
+ * @returns {Promise<{ uploads: number, batches: number, legacy: number }>}
+ */
+export async function wipeDue(query) {
+  const uploads = await wipeAbandonedUploads(query);
+  const batches = await query(DUE_BATCHES);
+  for (const row of batches) {
+    await wipeBatch(query, String(row.id));
+  }
+  const legacy = await query(DUE_LEGACY);
+  for (const row of legacy) {
+    await wipeFile(query, String(row.id));
+  }
+  return { uploads, batches: batches.length, legacy: legacy.length };
+}
+
 /**
  * @param {Query} query
  * @returns {Promise<number>}

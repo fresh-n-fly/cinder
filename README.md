@@ -6,6 +6,20 @@ File bytes, file names, and file types are locked in the browser. The password n
 
 This document is the operator’s guide. It covers a local try-out and a production install on Ubuntu 24.04 LTS or Debian 12.
 
+## Security + Privacy
+
+Cinder locks the files in the browser and keeps the server from learning the password, the file names, or the file types.
+
+**The password never leaves the browser.** The sender’s password is stretched with PBKDF2-SHA-256, 210,000 times, into an AES-256-GCM key. That key encrypts each 4 MB piece of each file before upload. A second salt produces a proof the server can check. The server stores a SHA-256 of that proof and compares it with a constant-time check. A correct proof returns the encryption salt and a 15-minute download ticket. The password itself is not sent, stored, or recoverable. There is no operator account and no password reset. The minimum is 12 characters, including a number and a symbol.
+
+**Names and types are locked too.** Each file name is padded to 1,024 bytes and each type to 128 bytes before encryption, so the stored length does not reveal how long the original was. Before the password is accepted, the page is told only the proof salt, the expiry, the download counters, whether the seal is locked, and how many files it holds. After a correct password, the browser decrypts the names and the file pieces. Each piece is bound to its position, so one piece cannot be swapped for another.
+
+**The link is unguessable, and use is limited.** A seal address is 32 random hex characters. The sender chooses an expiry, from 15 minutes up to 30 days, and a download count from 1 to 100. Twelve wrong passwords lock the seal until that expiry. When the expiry passes, or the downloads are used up and the 15-minute ticket has ended, a job running about once a minute overwrites the secret columns, deletes the rows, and rewrites those table files. The same wipe is available by hand with `deploy/purge.sh --yes`.
+
+**The host is kept small.** The installer puts PostgreSQL and the Node app on `127.0.0.1` only. Nginx is the service on ports 80 and 443, with HTTPS from an existing Let’s Encrypt certificate or a self-signed certificate. The database password is a new 48-character random value, written to `/opt/cinder/.env` mode `600`, and the install script does not print it. Download tickets are sent in the request body, and those responses are marked not to be cached.
+
+**What a database copy still shows.** Expiry, download counts, salts, the proof hash, the per-piece initialization vectors, and the byte length of each locked piece. That length is close to the original file size. A backup, the write-ahead log, and freed disk blocks can still hold ciphertext after a row is gone. Full-disk encryption is what covers those leftover blocks.
+
 ## What you are installing
 
 | Piece | Role |
@@ -304,19 +318,27 @@ If Nginx was stopped:
 sudo systemctl start nginx
 ```
 
+### Check that expired files are gone
+
+```bash
+sudo bash deploy/verify.sh
+```
+
+The script reads the database password from `/opt/cinder/.env` and does not print it. It lists what is still stored, then lists seals past their expiry, used-up seals whose download ticket has ended, uploads abandoned for more than two hours, and chunks left without a file. Exit 0 means those are gone from the live tables. A seal locked by wrong passwords, or one whose 15-minute download ticket is still valid, is supposed to remain.
+
 ### Purge every stored file
 
 Stop Cinder first. The purge rewrites the table files, and it refuses to start while Cinder, or any other database client, is still connected.
 
 ```bash
-sudo systemctl stop cinder
-sudo -u cinder bash -lc 'set -a; . /opt/cinder/.env; set +a; cd /opt/cinder && node scripts/purge.mjs --yes'
-sudo systemctl start cinder
+sudo bash deploy/purge.sh --yes
 ```
+
+That stops Cinder, runs the wipe, and starts Cinder again. Without `--yes` it refuses and leaves the service running.
 
 The script requires `--yes`. It overwrites each secret column with zeros, deletes the row, then runs `VACUUM FULL` on `sealed_file_chunks`, `sealed_files`, `sealed_batches`, and `upload_chunks`. `VACUUM FULL` builds a new table file that contains only the rows still present and drops the old file.
 
-The same overwrite, delete, and rewrite runs while the service is up, for a seal whose expiry has passed, a seal that has used its downloads, and an upload left unfinished for more than two hours. Up to 50 seals are cleared on one pass. The rewrite takes an exclusive lock on those tables, so other uploads and downloads wait until it finishes.
+Expired seals, seals that have used their downloads, and uploads left unfinished for more than two hours are cleared on a timer, about once a minute, whether or not anyone opens the site. A used-up seal stays until its 15-minute download ticket has ended. Each pass clears every due row, then rewrites the table files that changed. That rewrite takes an exclusive lock, so uploads and downloads wait until it finishes. The installer enables `cinder-expire.timer`. Run it once by hand with `sudo systemctl start cinder-expire.service`.
 
 Copies can remain in three places after either kind of delete:
 
@@ -425,11 +447,15 @@ Check `pg_hba.conf` allows `127.0.0.1` with a password, and that the role owns t
 ├── .env.example
 ├── deploy/
 │   ├── install.sh        # Debian and Ubuntu installer
-│   ├── cinder.service    # systemd unit
+│   ├── verify.sh         # check that expired rows are gone
+│   ├── purge.sh          # overwrite and delete every stored file
+│   ├── cinder.service    # systemd unit for the site
+│   ├── cinder-expire.service
+│   ├── cinder-expire.timer  # deletes expired seals every minute
 │   └── nginx.conf        # reverse proxy example
 ├── migrations/           # PostgreSQL schema
 ├── public/               # favicon and share image
-├── scripts/              # database migrator
+├── scripts/              # database migrator and expiry job
 └── src/                  # application
 ```
 

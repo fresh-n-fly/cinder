@@ -1,0 +1,14 @@
+[Unit]
+Description=Delete expired Cinder seals
+Documentation=file:///opt/cinder/README.md
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=cinder
+Group=cinder
+WorkingDirectory=/opt/cinder
+EnvironmentFile=/opt/cinder/.env
+ExecStart=/usr/bin/node scripts/expire.mjs
+Nice=10

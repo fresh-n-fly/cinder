@@ -29,6 +29,21 @@ function pgliteBootstrapPlugin(): Plugin {
         if (typeof mod.ensureDbReady === "function") {
           await mod.ensureDbReady();
         }
+        const vault = (await server.ssrLoadModule("/src/lib/vault.server.ts")) as {
+          purgeExpired?: () => Promise<void>;
+        };
+        if (typeof vault.purgeExpired === "function") {
+          const run = () => {
+            vault.purgeExpired?.().catch((err: unknown) => {
+              const message = err instanceof Error ? err.message : String(err);
+              console.error(`[cinder] expire failed: ${message}`);
+            });
+          };
+          run();
+          const timer = setInterval(run, 60_000);
+          timer.unref();
+          server.httpServer?.once("close", () => clearInterval(timer));
+        }
       } catch (err) {
         console.error("[cinder] database bootstrap failed:", err);
         throw err;
