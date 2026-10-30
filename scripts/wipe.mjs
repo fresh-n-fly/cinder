@@ -18,6 +18,7 @@ export const SECRET_TABLES = [
   "sealed_files",
   "sealed_batches",
   "upload_chunks",
+  "upload_sessions",
 ];
 
 const ZERO_LIMIT = 16 * 1024 * 1024;
@@ -102,6 +103,13 @@ export const SQL = {
     where upload_id = $1 and file_index = $2 and chunk_index = $3
     returning 1
   `,
+  DELETE_UPLOAD_SESSION: `delete from upload_sessions where id = $1 returning 1`,
+  ZERO_UPLOAD_SESSION: `
+    update upload_sessions
+    set client_ip = ${zeroText("client_ip")}
+    where id = $1
+    returning 1
+  `,
 };
 
 /**
@@ -170,6 +178,8 @@ export async function wipeUpload(query, uploadId) {
       row.chunk_index,
     ]);
   }
+  await changed(query, SQL.ZERO_UPLOAD_SESSION, [uploadId]);
+  await changed(query, SQL.DELETE_UPLOAD_SESSION, [uploadId]);
   return removed;
 }
 
@@ -194,7 +204,7 @@ const DUE_LEGACY = `
  * Delete every abandoned upload, expired seal, and used-up seal.
  * A used-up seal stays until its download ticket has ended.
  * @param {Query} query
- * @returns {Promise<{ uploads: number, batches: number, legacy: number }>}
+ * @returns {Promise<{ uploads: number, sessions: number, batches: number, legacy: number }>}
  */
 export async function wipeDue(query) {
   const uploads = await wipeAbandonedUploads(query);
@@ -206,21 +216,31 @@ export async function wipeDue(query) {
   for (const row of legacy) {
     await wipeFile(query, String(row.id));
   }
-  return { uploads, batches: batches.length, legacy: legacy.length };
+  return { uploads: uploads.chunks, sessions: uploads.sessions, batches: batches.length, legacy: legacy.length };
 }
 
 /**
  * @param {Query} query
- * @returns {Promise<number>}
+ * @returns {Promise<{ chunks: number, sessions: number }>}
  */
 export async function wipeAbandonedUploads(query) {
-  const rows = await query(
-    `select upload_id, file_index, chunk_index
-     from upload_chunks
-     where created_at < now() - interval '2 hours'
-     order by created_at`,
+  const sessions = await query(
+    `select id from upload_sessions
+     where state <> 'pending' or updated_at < now() - interval '2 hours'
+     order by updated_at
+     for update`,
   );
   let removed = 0;
+  for (const row of sessions) {
+    removed += await wipeUpload(query, String(row.id));
+  }
+  const rows = await query(
+    `select c.upload_id, c.file_index, c.chunk_index
+     from upload_chunks c
+     where c.created_at < now() - interval '2 hours'
+       and not exists (select 1 from upload_sessions s where s.id = c.upload_id)
+     order by c.created_at`,
+  );
   for (const row of rows) {
     await changed(query, SQL.ZERO_ONE_UPLOAD, [row.upload_id, row.file_index, row.chunk_index]);
     removed += await changed(query, SQL.DELETE_ONE_UPLOAD, [
@@ -229,7 +249,7 @@ export async function wipeAbandonedUploads(query) {
       row.chunk_index,
     ]);
   }
-  return removed;
+  return { chunks: removed, sessions: sessions.length };
 }
 
 /**
@@ -275,6 +295,12 @@ export async function wipeEverything(query, onProgress) {
       row.file_index,
       row.chunk_index,
     ]);
+  }
+
+  const sessions = await query("select id from upload_sessions");
+  for (const row of sessions) {
+    await changed(query, SQL.ZERO_UPLOAD_SESSION, [row.id]);
+    await changed(query, SQL.DELETE_UPLOAD_SESSION, [row.id]);
   }
 
   return { chunks: chunkCount, files: fileCount, batches: batchCount, uploads: uploadCount };
