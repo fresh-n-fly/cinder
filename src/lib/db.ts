@@ -47,6 +47,7 @@ export interface Sql {
  */
 const globalRef = globalThis as typeof globalThis & {
   __pgSqlPromise__?: Promise<Sql>;
+  __pgUploadSqlPromise__?: Promise<Sql>;
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgliteMigrateChain__?: Promise<void>;
 };
@@ -88,15 +89,38 @@ function toSql(run: Run, transaction?: Transaction): Sql {
   return sql;
 }
 
-function createNeonSql(): Promise<Sql> {
-  globalRef.__pgSqlPromise__ ??= (async () => {
+/**
+ * Two pools, so uploads can never take every connection:
+ *
+ * - "main" serves page loads, unlocks, and downloads. Queries are capped at
+ *   30 s and a request waits at most 10 s for a free connection.
+ * - "upload" serves start, chunk, finish, and cancel. Those serialize on the
+ *   upload quota lock, so a request gives up after waiting 5 s for a lock
+ *   (the client retries) instead of holding a connection while it queues.
+ *   Finishing a large seal copies gigabytes in one statement, so the
+ *   statement cap here is much higher.
+ */
+const POOLS = {
+  main: { max: 10, connectionTimeoutMillis: 10_000, statement_timeout: 30_000, lock_timeout: 10_000 },
+  upload: { max: 4, connectionTimeoutMillis: 10_000, statement_timeout: 900_000, lock_timeout: 5_000 },
+} as const;
+
+function createNeonSql(kind: keyof typeof POOLS = "main"): Promise<Sql> {
+  const slot = kind === "main" ? "__pgSqlPromise__" : "__pgUploadSqlPromise__";
+  globalRef[slot] ??= (async () => {
     // Regular Postgres driver: node-postgres (`pg`) — works directly with Neon's
-    // pooled endpoint. One pool per process; warm serverless instances reuse it.
+    // pooled endpoint. One pool of each kind per process.
     const { Pool, types } = await import("pg");
     types.setTypeParser(OID_INT8, Number);
     types.setTypeParser(OID_DATE, identity);
     types.setTypeParser(OID_INTERVAL, identity);
-    const pool = new Pool({ connectionString: databaseUrl });
+    const pool = new Pool({
+      connectionString: databaseUrl,
+      ...POOLS[kind],
+      idle_in_transaction_session_timeout: 60_000,
+    });
+    // An idle client that loses its connection must not crash the process.
+    pool.on("error", () => undefined);
     const run = async <T>(text: string, params: unknown[]) => {
       const res = await pool.query(text, params);
       return res.rows as T[];
@@ -120,10 +144,10 @@ function createNeonSql(): Promise<Sql> {
       }
     });
   })().catch((err) => {
-    globalRef.__pgSqlPromise__ = undefined;
+    globalRef[slot] = undefined;
     throw err;
   });
-  return globalRef.__pgSqlPromise__;
+  return globalRef[slot];
 }
 
 async function createPgliteSql(): Promise<Sql> {
@@ -221,6 +245,18 @@ export function getSql(): Promise<Sql> {
     throw err;
   });
   return sqlPromise;
+}
+
+/**
+ * The SQL client for upload requests (start, chunk, finish, cancel). On
+ * PostgreSQL it is a separate, smaller pool so uploads waiting on the quota
+ * lock cannot starve unlocks and downloads. PGLite has one connection anyway.
+ */
+export async function getUploadSql(): Promise<Sql> {
+  if (dbSource !== "neon") return getSql();
+  if (typeof window !== "undefined") throw new Error("@/lib/db is server-only.");
+  await getSql();
+  return createNeonSql("upload");
 }
 
 /**

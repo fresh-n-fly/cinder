@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { fetchFileChunk, unlockBatch } from "@/lib/vault.server";
 import { MAX_OPEN_FORM_BODY_BYTES, MAX_OPEN_JSON_BODY_BYTES } from "@/lib/constants";
-import { clientIp, errorStatus, isJsonContentType, readFormBody, readJsonBody } from "@/lib/http.server";
+import { clientIp, errorResponse, isJsonContentType, readFormBody, readJsonBody } from "@/lib/http.server";
 
 function asString(value: FormDataEntryValue | null): string {
   return typeof value === "string" ? value : "";
@@ -23,7 +23,15 @@ export const Route = createFileRoute("/api/open")({
               return Response.json({ error: "Unknown action." }, { status: 400 });
             }
             const ip = clientIp(request);
-            const result = await unlockBatch(String(body.id ?? ""), String(body.verifier ?? ""), ip);
+            const result = await unlockBatch(
+              String(body.id ?? ""),
+              {
+                verifier: String(body.verifier ?? ""),
+                proof: String(body.proof ?? ""),
+                verifier2: String(body.verifier2 ?? ""),
+              },
+              ip,
+            );
             if (!result.ok) {
               // Fail2ban reads this line. Only counted wrong passwords carry
               // remainingAttempts, so lookups of missing seals are not logged.
@@ -72,8 +80,7 @@ export const Route = createFileRoute("/api/open")({
             },
           });
         } catch (err) {
-          const message = err instanceof Error ? err.message : "Could not open the file.";
-          return Response.json({ error: message }, { status: errorStatus(message) });
+          return errorResponse(err, "Could not open the file.");
         }
       },
     },

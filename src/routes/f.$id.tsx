@@ -27,6 +27,7 @@ function UnlockPage() {
               <UnlockForm
                 id={id}
                 meta={{
+                  kdf: meta.kdf,
                   saltAuth: meta.saltAuth,
                   expiresAt: meta.expiresAt,
                   maxDownloads: meta.maxDownloads,

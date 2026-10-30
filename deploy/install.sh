@@ -208,7 +208,12 @@ install_node() {
     cd "$tmp"
     grep -F "  ${file}" SHASUMS256.txt | sha256sum -c -
   ) || die "The Node.js download did not match its published checksum."
-  tar -xJf "$tmp/$file" -C /usr/local --strip-components=1
+  # The release tarball records its builder's UID (1001) as owner. As root,
+  # tar would apply that owner to /usr/local/bin and the node binary, handing
+  # them to whichever local account has that UID. Extract as root-owned, with
+  # the tarball's own modes (not a restrictive root umask, which would leave
+  # node unreadable to the cinder user).
+  tar --no-same-owner -xJf "$tmp/$file" -C /usr/local --strip-components=1
   rm -rf "$tmp"
   hash -r
   command -v node >/dev/null 2>&1 || die "Node.js installed, but node is not on PATH."
@@ -216,9 +221,36 @@ install_node() {
   say "Installed $(node -v)."
 }
 
+# Repair installs made before tar ran with --no-same-owner. Directories under
+# /usr/local that a non-root account owns go back to root:root (directories
+# root already owns, such as Debian's root:staff ones, are not touched); Node's
+# own files become root-owned and writable by root only.
+repair_node_ownership() {
+  local path
+  for path in /usr/local /usr/local/bin /usr/local/lib /usr/local/include /usr/local/share \
+    /usr/local/share/doc /usr/local/share/man /usr/local/share/man/man1; do
+    if [[ -d "$path" && ! -L "$path" && "$(stat -c %u "$path")" != 0 ]]; then
+      say "Returning ${path} to root; it was owned by UID $(stat -c %u "$path")."
+      chown root:root "$path"
+    fi
+  done
+  for path in /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+    /usr/local/lib/node_modules /usr/local/include/node /usr/local/share/doc/node \
+    /usr/local/share/man/man1/node.1 /usr/local/CHANGELOG.md /usr/local/LICENSE /usr/local/README.md; do
+    if [[ -L "$path" ]]; then
+      chown -h root:root "$path"
+    elif [[ -e "$path" ]]; then
+      chown -R root:root "$path"
+      chmod -R go-w "$path"
+    fi
+  done
+}
+
 install_node
+repair_node_ownership
 NODE_BIN=$(readlink -f "$(command -v node)")
 [[ -x "$NODE_BIN" ]] || die "Cannot resolve the node binary."
+[[ "$(stat -c %u "$NODE_BIN")" == 0 ]] || die "${NODE_BIN} is not owned by root. Fix its ownership before installing."
 
 say "Starting PostgreSQL."
 systemctl enable postgresql
@@ -364,8 +396,8 @@ fi
 if ! grep -Eq '^CINDER_CLIENT_KEY_SECRET=[0-9a-fA-F]{64,}$' "$PREFIX/.env"; then
   upsert_env "$PREFIX/.env" CINDER_CLIENT_KEY_SECRET "$(openssl rand -hex 32)"
 fi
-chown cinder:cinder "$PREFIX/.env"
-chmod 600 "$PREFIX/.env"
+chown root:cinder "$PREFIX/.env"
+chmod 640 "$PREFIX/.env"
 db_url=$(env_get DATABASE_URL "$PREFIX/.env")
 [[ -n "$db_url" ]] || die "DATABASE_URL is missing from ${PREFIX}/.env."
 
@@ -406,8 +438,21 @@ if [[ "$db_ok" != 1 ]]; then
 fi
 rm -f /tmp/cinder-psql.err
 
-say "Giving the application tree to the cinder user."
+# The build runs third-party code as cinder, so the tree is cinder's only for
+# that step, and the environment file stays root's throughout. If anything
+# fails before the tree is handed back, the EXIT trap hands it back anyway.
+lock_down_tree() {
+  chown -R root:root "$PREFIX"
+  chmod -R go-w "$PREFIX"
+  chown root:cinder "$PREFIX/.env"
+  chmod 640 "$PREFIX/.env"
+}
+trap 'status=$?; lock_down_tree || true; if [[ $status -ne 0 && -z "$FAILED_MSG" ]]; then printf "error: install stopped near line %s (exit %s).\n" "$LINENO" "$status" >&2; fi' EXIT
+
+say "Giving the application tree to the cinder user for the build."
 chown -R cinder:cinder "$PREFIX"
+chown root:cinder "$PREFIX/.env"
+chmod 640 "$PREFIX/.env"
 
 lock_sum=$(sha256sum "$PREFIX/package-lock.json" | awk '{print $1}')
 say "Installing npm packages. This often takes a few minutes."
@@ -455,16 +500,18 @@ if ! grep -q '\[migrate\]' "$build_log"; then
   die "The build log has no migration result. See ${build_log}."
 fi
 [[ -f "$PREFIX/.output/server/index.mjs" ]] || die "The build did not produce .output/server/index.mjs."
-chown -R root:root "$PREFIX"
-chown cinder:cinder "$PREFIX/.env"
-chmod 600 "$PREFIX/.env"
+# The app runs as cinder but owns nothing it runs: after any code execution in
+# the app, it cannot rewrite its code or its environment file (for example to
+# add NODE_OPTIONS that every later start would load). systemd reads the
+# environment file as root; the group lets scripts run as cinder read it.
+lock_down_tree
 
 say "Installing the systemd service."
 sed \
   -e "s|^WorkingDirectory=.*|WorkingDirectory=${PREFIX}|" \
   -e "s|^EnvironmentFile=.*|EnvironmentFile=${PREFIX}/.env|" \
   -e "s|^ExecStart=.*|ExecStart=${NODE_BIN} .output/server/index.mjs|" \
-  -e "s|^ReadWritePaths=.*|ReadWritePaths=${PREFIX}|" \
+  -e "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${PREFIX}|" \
   -e "s|^Documentation=.*|Documentation=file://${PREFIX}/README.md|" \
   "$PREFIX/deploy/cinder.service" > /etc/systemd/system/cinder.service
 sed \
@@ -731,7 +778,7 @@ write_nginx() {
   site=/etc/nginx/sites-available/cinder
   {
     printf '%s\n' "# Written by deploy/install.sh. Run that script again to replace this file."
-    printf '%s\n' "# Uploads arrive in pieces of about 4 MB. client_max_body_size must stay at least 8m."
+    printf '%s\n' "# Uploads arrive in pieces of about 4 MB, so /api/seal accepts 8m; everything else 64k."
     printf '%s\n' "# Form bodies on /api/open are chunk downloads; every other body gets the strict unlock limit."
     printf '%s\n' "map \$http_content_type \$cinder_unlock_key {"
     printf '%s\n' "    default \$binary_remote_addr;"
@@ -747,6 +794,14 @@ write_nginx() {
     printf '%s\n' "limit_req_zone \$binary_remote_addr zone=cinder_open:10m rate=100r/s;"
     printf '%s\n' "limit_req_zone \$binary_remote_addr zone=cinder_seal:10m rate=20r/s;"
     printf '%s\n' "limit_req_zone \$cinder_post_key zone=cinder_post:10m rate=20r/s;"
+    printf '%s\n' "# GETs (pages, assets, the seal lookup) are limited per address as well."
+    printf '%s\n' "map \$request_method \$cinder_get_key {"
+    printf '%s\n' "    default \"\";"
+    printf '%s\n' "    GET \$binary_remote_addr;"
+    printf '%s\n' "    HEAD \$binary_remote_addr;"
+    printf '%s\n' "}"
+    printf '%s\n' "limit_req_zone \$cinder_get_key zone=cinder_get:10m rate=10r/s;"
+    printf '%s\n' "limit_conn_zone \$binary_remote_addr zone=cinder_conn:10m;"
     printf '%s\n' "upstream cinder {"
     printf '%s\n' "    server 127.0.0.1:3000;"
     printf '%s\n' "    keepalive 16;"
@@ -787,7 +842,7 @@ ${http2_line}
 ${le_ssl}
 
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "no-referrer" always;
@@ -798,13 +853,28 @@ ${le_ssl}
     # The app's URL parser turns "\\" into "/"; refuse it so no path variant skips the API locations.
     if (\$request_uri ~ "(\x5c|%5[cC])") { return 400; }
 
-    client_max_body_size 8m;
+    # No path the app serves contains a percent-escape. nginx matches locations on
+    # the decoded path while the app routes the raw one, so an escape such as
+    # "/api/open%20" could otherwise land in a looser location. Refuse them all.
+    if (\$request_uri ~ "^[^?]*%") { return 400; }
+
+    # One address may hold 40 requests at once; slow or stalled clients are dropped.
+    limit_conn cinder_conn 40;
+    limit_conn_status 429;
+    client_header_timeout 10s;
+    client_body_timeout 20s;
+    send_timeout 30s;
+    keepalive_timeout 20s;
+
+    # Only upload chunks are large; every other body is a few kilobytes.
+    client_max_body_size 64k;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
 
-    location ~* ^/api/open/?$ {
+    location ~* ^/api/open {
         limit_req zone=cinder_open burst=200 nodelay;
         limit_req zone=cinder_unlock burst=5 nodelay;
+        limit_req zone=cinder_get burst=60 nodelay;
         limit_req_status 429;
 
         proxy_pass http://cinder;
@@ -818,8 +888,11 @@ ${le_ssl}
         proxy_send_timeout 300s;
     }
 
-    location ~* ^/api/seal/?$ {
+    location ~* ^/api/seal {
         limit_req zone=cinder_seal burst=40 nodelay;
+        limit_req zone=cinder_get burst=60 nodelay;
+        client_max_body_size 8m;
+        # Finishing a large seal copies gigabytes before it answers.
         limit_req_status 429;
 
         proxy_pass http://cinder;
@@ -829,12 +902,13 @@ ${le_ssl}
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Connection        "";
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        proxy_read_timeout 900s;
+        proxy_send_timeout 900s;
     }
 
     location / {
         limit_req zone=cinder_post burst=40 nodelay;
+        limit_req zone=cinder_get burst=60 nodelay;
         limit_req_status 429;
 
         proxy_pass http://cinder;
@@ -879,7 +953,7 @@ ${http2_line}
     ssl_session_cache shared:SSL:10m;
 
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "no-referrer" always;
@@ -890,13 +964,28 @@ ${http2_line}
     # The app's URL parser turns "\\" into "/"; refuse it so no path variant skips the API locations.
     if (\$request_uri ~ "(\x5c|%5[cC])") { return 400; }
 
-    client_max_body_size 8m;
+    # No path the app serves contains a percent-escape. nginx matches locations on
+    # the decoded path while the app routes the raw one, so an escape such as
+    # "/api/open%20" could otherwise land in a looser location. Refuse them all.
+    if (\$request_uri ~ "^[^?]*%") { return 400; }
+
+    # One address may hold 40 requests at once; slow or stalled clients are dropped.
+    limit_conn cinder_conn 40;
+    limit_conn_status 429;
+    client_header_timeout 10s;
+    client_body_timeout 20s;
+    send_timeout 30s;
+    keepalive_timeout 20s;
+
+    # Only upload chunks are large; every other body is a few kilobytes.
+    client_max_body_size 64k;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
 
-    location ~* ^/api/open/?$ {
+    location ~* ^/api/open {
         limit_req zone=cinder_open burst=200 nodelay;
         limit_req zone=cinder_unlock burst=5 nodelay;
+        limit_req zone=cinder_get burst=60 nodelay;
         limit_req_status 429;
 
         proxy_pass http://cinder;
@@ -910,8 +999,11 @@ ${http2_line}
         proxy_send_timeout 300s;
     }
 
-    location ~* ^/api/seal/?$ {
+    location ~* ^/api/seal {
         limit_req zone=cinder_seal burst=40 nodelay;
+        limit_req zone=cinder_get burst=60 nodelay;
+        client_max_body_size 8m;
+        # Finishing a large seal copies gigabytes before it answers.
         limit_req_status 429;
 
         proxy_pass http://cinder;
@@ -921,12 +1013,13 @@ ${http2_line}
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header Connection        "";
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        proxy_read_timeout 900s;
+        proxy_send_timeout 900s;
     }
 
     location / {
         limit_req zone=cinder_post burst=40 nodelay;
+        limit_req zone=cinder_get burst=60 nodelay;
         limit_req_status 429;
 
         proxy_pass http://cinder;
@@ -1121,6 +1214,6 @@ if [[ "$tls_kind" == "letsencrypt" && -n "$DOMAIN" ]]; then
 fi
 say ""
 say "Node listens on 127.0.0.1:3000. PostgreSQL listens on 127.0.0.1:5432."
-say "The database password is in ${PREFIX}/.env (mode 600). This script does not print it."
+say "The database password is in ${PREFIX}/.env (root:cinder, mode 640). This script does not print it."
 say "Logs: journalctl -u cinder -e"
 say "Update later by running this script again."

@@ -7,7 +7,7 @@ export const Route = createFileRoute("/how")({ component: HowPage });
 const SECTIONS = [
   {
     title: "What you choose",
-    body: "Pick your files, a password, an expiry date, and how many times they may be downloaded. The password must be at least 12 characters and include a number and a special character, such as ! or #. Dates are written as day/month/year. Times are in GMT.",
+    body: "Pick your files, a password, an expiry date, and how many times they may be downloaded. A strong password is filled in for you; send it separately from the link. If you type your own, it must be at least 12 characters and hard to guess: a word with a year or a symbol added is refused. Dates are written as day/month/year. Times are in GMT.",
   },
   {
     title: "Locked before they leave",

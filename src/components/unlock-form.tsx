@@ -4,16 +4,15 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { MIME_PAD_BYTES, NAME_PAD_BYTES } from "@/lib/constants";
+import { KDF_VERSION, MAX_FETCH_CHUNK_INDEX, MIME_PAD_BYTES, NAME_PAD_BYTES } from "@/lib/constants";
 import {
   chunkAad,
   decryptPadded,
   decryptWithKey,
-  deriveBatchKey,
-  deriveVerifierHex,
+  deriveKdf1Key,
   nameAad,
+  prepareUnlock,
   typeAad,
-  unsealFile,
   zeroBytes,
 } from "@/lib/crypto/vault";
 import { formatBytes, formatExpiry } from "@/lib/files";
@@ -21,6 +20,7 @@ import { beginSave } from "@/lib/save-file";
 import { pullCipherChunk, pullCiphertextChunks } from "@/lib/upload";
 
 export type UnlockMeta = {
+  kdf: number;
   saltAuth: string;
   expiresAt: string;
   maxDownloads: number;
@@ -79,8 +79,19 @@ function isIntegrityFailure(err: unknown): boolean {
  * - Every other file has a 32-hex nonce; anything else is injected text.
  * - Format-2 seals bind each file's position and the file count, so positions
  *   must be exactly 0..n-1.
+ * - Every file has at least one piece. A count of zero would decrypt nothing
+ *   and "save" an empty file; any other wrong count fails decryption.
+ * - Seals made with key derivation 2 were all written in format 2.
  */
-function checkBatchShape(files: ServerFile[]): void {
+function checkBatchShape(files: ServerFile[], kdf: number): void {
+  if (
+    files.some(
+      (file) => !Number.isInteger(file.chunkCount) || file.chunkCount < 1 || file.chunkCount > MAX_FETCH_CHUNK_INDEX,
+    )
+  ) {
+    throw new Error(TAMPERED);
+  }
+  if (kdf === KDF_VERSION && files.some((file) => file.legacy || file.aadVersion !== 2)) throw new Error(TAMPERED);
   const legacy = files.filter((file) => file.legacy);
   if (legacy.length > 0) {
     const name = legacy[0]?.originalName ?? "";
@@ -101,8 +112,9 @@ function checkBatchShape(files: ServerFile[]): void {
   if (!valid) throw new Error(TAMPERED);
 }
 
-function triggerDownload(data: ArrayBuffer, name: string, mime: string) {
-  const blob = new Blob([data], { type: mime || "application/octet-stream" });
+function triggerDownload(data: ArrayBuffer, name: string) {
+  // Always a plain download: legacy seals stored their type unauthenticated.
+  const blob = new Blob([data], { type: "application/octet-stream" });
   const href = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = href;
@@ -121,12 +133,12 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
   const [locked, setLocked] = useState(meta.locked);
   const [remaining, setRemaining] = useState(meta.remaining);
   const [completed, setCompleted] = useState(false);
+  // The session keeps the derived, non-extractable key, not the password.
   const [session, setSession] = useState<{
     ticket: string;
-    saltEnc: string;
+    key: CryptoKey;
     lastAccess: boolean;
     files: ReadyFile[];
-    password: string;
   } | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [saveLabel, setSaveLabel] = useState<string | null>(null);
@@ -139,24 +151,18 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
       ? "Sealed file"
       : `${meta.fileCount} sealed files`;
 
-  async function downloadOpened(
-    opened: ReadyFile,
-    ticket: string,
-    saltEnc: string,
-    pass: string,
-  ) {
+  async function downloadOpened(opened: ReadyFile, ticket: string, key: CryptoKey) {
     setDownloadingId(opened.id);
     setSaveLabel(null);
     try {
       if (opened.legacy) {
         const ciphertext = await pullCiphertextChunks(ticket, opened.id, opened.chunkCount);
-        const plaintext = await unsealFile(ciphertext, pass, saltEnc, opened.iv, opened.name);
-        triggerDownload(plaintext, opened.name, opened.mime);
+        const plaintext = await decryptWithKey(key, ciphertext, opened.iv, opened.name);
+        triggerDownload(plaintext, opened.name);
         return;
       }
       const sink = await beginSave(opened.name);
       try {
-        const key = await deriveBatchKey(pass, saltEnc);
         let written = 0;
         for (let index = 0; index < opened.chunkCount; index += 1) {
           const pulled = await pullCipherChunk(ticket, opened.id, index);
@@ -193,11 +199,11 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
     if (locked || gone || session) return;
     setBusy(true);
     try {
-      const verifier = await deriveVerifierHex(password, meta.saltAuth);
+      const prepared = await prepareUnlock(password, meta.kdf, meta.saltAuth);
       const response = await fetch("/api/open", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ intent: "unlock", id, verifier }),
+        body: JSON.stringify({ intent: "unlock", id, ...prepared.body }),
       });
       const payload = (await response.json().catch(() => ({}))) as {
         error?: string;
@@ -212,11 +218,11 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
         if (response.status === 423) setLocked(true);
         throw new Error(payload.error || "Could not unlock the files.");
       }
-      if (!payload.ticket || !payload.saltEnc || !payload.files?.length) {
+      if (!payload.ticket || !payload.files?.length || (!prepared.key && !payload.saltEnc)) {
         throw new Error("The server returned an incomplete batch.");
       }
-      checkBatchShape(payload.files);
-      const key = await deriveBatchKey(password, payload.saltEnc);
+      checkBatchShape(payload.files, meta.kdf);
+      const key = prepared.key ?? (await deriveKdf1Key(password, meta.saltAuth, payload.saltEnc ?? ""));
       const fileCount = payload.files.length;
       const ready: ReadyFile[] = [];
       for (const file of payload.files) {
@@ -271,10 +277,9 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
       setRemaining(remainingAfter);
       setSession({
         ticket: payload.ticket,
-        saltEnc: payload.saltEnc,
+        key,
         lastAccess: Boolean(payload.lastAccess),
         files: ready,
-        password,
       });
       setPassword("");
       if (payload.lastAccess) {
@@ -290,7 +295,7 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
   async function onDownload(file: ReadyFile) {
     if (!session) return;
     try {
-      await downloadOpened(file, session.ticket, session.saltEnc, session.password);
+      await downloadOpened(file, session.ticket, session.key);
       toast.success(`Saved ${file.name}`);
       if (session.lastAccess) setCompleted(true);
     } catch (err) {
@@ -306,7 +311,7 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
     if (!session) return;
     for (const file of session.files) {
       try {
-        await downloadOpened(file, session.ticket, session.saltEnc, session.password);
+        await downloadOpened(file, session.ticket, session.key);
       } catch (err) {
         if (isAbort(err)) {
           toast.error("Save cancelled.");

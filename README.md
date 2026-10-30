@@ -10,13 +10,13 @@ This document is the operator’s guide. It covers a local try-out and a product
 
 Cinder locks the files in the browser and keeps the server from learning the password, the file names, or the file types.
 
-**The password never leaves the browser.** The sender’s password is stretched with PBKDF2-SHA-256, 210,000 times, into an AES-256-GCM key. That key encrypts each 4 MB piece of each file before upload. A second salt produces a proof the server can check. The server stores a SHA-256 of that proof and compares it with a constant-time check. A correct proof returns the encryption salt and a 15-minute download ticket. Every unlock gets its own ticket; the server stores only a SHA-256 of it, and a ticket allows about two passes over the seal before it stops working. The password itself is not sent, stored, or recoverable. There is no operator account and no password reset. The minimum is 12 characters, including a number and a symbol.
+**The password never leaves the browser.** The sender’s password and a random salt go through Argon2id (64 MiB of memory, 3 passes). HKDF-SHA-256 then splits the result, under two different labels, into an AES-256-GCM key and a proof the server can check, so the proof never reveals the key, whatever salt the server hands out. The cost settings are fixed in the page, not read from the server. The key encrypts each 4 MB piece of each file before upload. The server stores a SHA-256 of the proof and compares it with a constant-time check. Seals made before this scheme used PBKDF2-SHA-256 with separate salts; for those the page sends only a hash of the proof, and it stops accepting that older scheme on 15 December 2026, after every such seal has expired. A correct proof returns the encryption salt and a 15-minute download ticket. Every unlock gets its own ticket; the server stores only a SHA-256 of it, and a ticket allows about two passes over the seal before it stops working. The password itself is not sent, stored, or recoverable. There is no operator account and no password reset. The page starts with a generated 16-character password. A typed one must be at least 12 characters and must not look like a common pattern (a dictionary word with a year or a symbol, a keyboard run, a repeated character).
 
-**Names and types are locked too.** Each file name is padded to 1,024 bytes and each type to 128 bytes before encryption, so the stored length does not reveal how long the original was. Before the password is accepted, the page is told only the proof salt, the expiry, the download counters, whether the seal is locked, and how many files it holds. After a correct password, the browser decrypts the names and the file pieces. Each piece is bound to its position and to the number of pieces in its file, and each name and type to the file's position and the number of files in the seal. Swapping, dropping, or cutting off pieces or files makes decryption fail instead of producing a shorter file.
+**Names and types are locked too.** Each file name is padded to 1,024 bytes and each type to 128 bytes before encryption, so the stored length does not reveal how long the original was. Before the password is accepted, the page is told only the key-derivation version and salt, the expiry, the download counters, whether the seal is locked, and how many files it holds. After a correct password, the browser decrypts the names and the file pieces. Each piece is bound to its position and to the number of pieces in its file, and each name and type to the file's position and the number of files in the seal. Swapping, dropping, or cutting off pieces or files makes decryption fail instead of producing a shorter file.
 
 **The link is unguessable, and use is limited.** A seal address is 32 random hex characters. The sender chooses an expiry, from 15 minutes up to 30 days, and a download count from 1 to 100. One connection (an IPv4 address, or an IPv6 /64) may get the password wrong five times; thirty wrong passwords in total lock the seal until that expiry, so locking someone else's seal takes several distinct networks. When the expiry passes, or the downloads are used up and the last download ticket has ended, a job running about once a minute overwrites the secret columns and deletes the rows. Once a day a second job rewrites the table files so the deleted rows leave the disk. The same wipe is available by hand with `deploy/purge.sh --yes`.
 
-**The host is kept small.** The installer puts PostgreSQL and the Node app on `127.0.0.1` only. Nginx is the service on ports 80 and 443; port 80 redirects to HTTPS, using an existing Let’s Encrypt certificate or a self-signed certificate. The database password is a new 48-character random value, written to `/opt/cinder/.env` mode `600`, and the install script does not print it. Download tickets are sent in the request body, and those responses are marked not to be cached.
+**The host is kept small.** The installer puts PostgreSQL and the Node app on `127.0.0.1` only. Nginx is the service on ports 80 and 443; port 80 redirects to HTTPS, using an existing Let’s Encrypt certificate or a self-signed certificate. The database password is a new 48-character random value, written to `/opt/cinder/.env` (owner `root`, group `cinder`, mode `640`), and the install script does not print it. The app tree and that file are owned by root, so the app cannot change its own code or environment. Download tickets are sent in the request body, and those responses are marked not to be cached.
 
 **What a database copy still shows.** Expiry, download counts, salts, the proof hash, the per-piece initialization vectors, the byte length of each locked piece, and keyed hashes used for per-connection limits (an HMAC under a secret in `/opt/cinder/.env`, never the address itself). That length is close to the original file size. A backup, the write-ahead log, and freed disk blocks can still hold ciphertext after a row is gone. Full-disk encryption is what covers those leftover blocks.
 
@@ -38,7 +38,7 @@ Limits, as shipped:
 - About 5 GB stored at once per connection (IPv4 address or IPv6 /64)
 - An upload must finish within 12 hours
 - 20 GB combined for everything stored on the service at once, including uploads still in progress
-- Password: at least 12 characters, with a number and a special character
+- Password: generated for you, or at least 12 characters that are hard to guess
 - Expiry: up to 30 days, entered as day/month/year in GMT
 
 ## Requirements
@@ -99,7 +99,7 @@ If `/etc/letsencrypt/live/` already contains a certificate, the installer uses t
 
 The installer does not open port 3000. If UFW is already on, it allows OpenSSH and Nginx. If UFW is off, it leaves the firewall alone. It does not delete an existing database.
 
-The generated Nginx site rate-limits unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance (any body that is not a chunk-download form counts as an unlock), applies a looser limit to chunk downloads, rate-limits `/api/seal`, rate-limits every other POST, and refuses any URL containing a backslash. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
+The generated Nginx site rate-limits unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance (any body that is not a chunk-download form counts as an unlock), applies a looser limit to chunk downloads, rate-limits `/api/seal`, every other POST, and every GET (pages, assets, seal lookups), caps each address at 40 requests at once, drops clients that stall, accepts bodies over 64 KB only on `/api/seal`, and refuses any URL whose path contains a percent-escape or a backslash. The API locations match by prefix, so no path suffix moves a request to a looser limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
 
 To see or clear those bans:
 
@@ -238,6 +238,15 @@ Use `--legacy-peer-deps`, as in the local try-out. Do not run `npm install`. `PL
 If the build prints that `DATABASE_URL` is not set, the environment file was not loaded. Stop and fix that before continuing. An in-memory database in production would lose every file on restart.
 
 After a successful build you should have `/opt/cinder/.output/server/index.mjs`.
+
+Then hand the tree back to root, so the running app cannot change its own code or environment file:
+
+```bash
+sudo chown -R root:root /opt/cinder
+sudo chmod -R go-w /opt/cinder
+sudo chown root:cinder /opt/cinder/.env
+sudo chmod 640 /opt/cinder/.env
+```
 
 ### 8. systemd
 
@@ -388,6 +397,10 @@ cd /opt/cinder
 sudo chown -R cinder:cinder /opt/cinder
 sudo -u cinder env PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --legacy-peer-deps
 sudo -u cinder -E bash -lc 'set -a; . /opt/cinder/.env; set +a; npm run build'
+sudo chown -R root:root /opt/cinder
+sudo chmod -R go-w /opt/cinder
+sudo chown root:cinder /opt/cinder/.env
+sudo chmod 640 /opt/cinder/.env
 sudo systemctl restart cinder
 ```
 
@@ -417,7 +430,7 @@ Plan database disk for the ciphertext. New seals are stored as encrypted chunks 
 
 - Use HTTPS. The password never travels to the server. Download tickets do. File names and types do not: they are locked before upload.
 - What stays readable in the database is operational: expiry, download counters, salts, per-chunk initialization vectors, and the byte length of each locked slice. That length is required to store and serve the slice. It is a close stand-in for the original size.
-- Keep `DATABASE_URL` and `CINDER_CLIENT_KEY_SECRET` in `/opt/cinder/.env` with mode `600` and owner `cinder`. The secret keys the hashes used for per-connection limits; anyone holding it can test whether a given address made an upload or a wrong-password attempt that is still stored.
+- Keep `DATABASE_URL` and `CINDER_CLIENT_KEY_SECRET` in `/opt/cinder/.env`, owned by `root` with group `cinder` and mode `640`, and keep the rest of `/opt/cinder` owned by root. If the app user could write either, anything that ran code in the app could make itself permanent. The secret keys the hashes used for per-connection limits; anyone holding it can test whether a given address made an upload or a wrong-password attempt that is still stored.
 - The app log records the client address of each counted wrong password, so Fail2ban can act on it. Set a journald retention (`MaxRetentionSec=`) that matches how long you want addresses kept.
 - Browsers without a save-file picker (Firefox, Safari) receive downloads through a small service worker (`/save-sw.js`), so decrypted files are not written to the site's storage.
 - Do not put Cinder behind a cache that stores POST bodies or `/api/open` responses.
