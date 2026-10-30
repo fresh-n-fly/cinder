@@ -1,5 +1,5 @@
 import { Eye, EyeOff, LoaderCircle, Shuffle } from "lucide-react";
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 import { DropZone } from "@/components/drop-zone";
 import { FileReceipt, type Receipt } from "@/components/file-receipt";
@@ -12,6 +12,7 @@ import {
   MIME_PAD_BYTES,
   MIN_PASSWORD_LENGTH,
   NAME_PAD_BYTES,
+  SEAL_FORMAT,
 } from "@/lib/constants";
 import {
   chunkAad,
@@ -62,6 +63,13 @@ export function SealForm() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
   const [receipt, setReceipt] = useState<Receipt | null>(null);
+
+  // Start from a generated password, shown so it can be copied. A typed one
+  // must still pass the strength check.
+  useEffect(() => {
+    setPassword((current) => current || generatePassphrase());
+    setShowPassword(true);
+  }, []);
 
   const score = passwordScore(password);
   const activePreset = useMemo(() => {
@@ -171,7 +179,7 @@ export function SealForm() {
       setProgress("Finishing");
       const result = await finishUpload({
         uploadId,
-        format: AAD_VERSION,
+        format: SEAL_FORMAT,
         saltAuth: keys.saltAuth,
         saltEnc: keys.saltEnc,
         authHash: keys.authHash,
@@ -188,7 +196,8 @@ export function SealForm() {
         url: `${window.location.origin}/f/${result.id}`,
       });
       setFiles([]);
-      setPassword("");
+      setPassword(generatePassphrase());
+      setShowPassword(true);
       setProgress(null);
     } catch (err) {
       if (uploadId) await cancelUpload(uploadId).catch(() => undefined);
@@ -228,7 +237,10 @@ export function SealForm() {
           <button
             type="button"
             className="inline-flex h-11 items-center gap-1.5 text-xs text-muted hover:text-fg"
-            onClick={() => setPassword(generatePassphrase())}
+            onClick={() => {
+              setPassword(generatePassphrase());
+              setShowPassword(true);
+            }}
           >
             <Shuffle className="size-3.5" />
             Generate
@@ -242,9 +254,10 @@ export function SealForm() {
             value={password}
             onChange={(event) => setPassword(event.target.value)}
             minLength={MIN_PASSWORD_LENGTH}
+            maxLength={256}
             required
             className="pr-12"
-            placeholder="12+ characters, a number, and a special character"
+            placeholder="12+ characters that are hard to guess"
           />
           <button
             type="button"

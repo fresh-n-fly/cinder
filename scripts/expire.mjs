@@ -14,7 +14,7 @@
  * exits with an error in that case.
  */
 import pg from "pg";
-import { SECRET_TABLES, wipeDue } from "./wipe.mjs";
+import { SECRET_TABLES, expireDue } from "./wipe.mjs";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 if (!databaseUrl) {
@@ -28,17 +28,26 @@ const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
 
 async function main() {
   const client = await pool.connect();
-  let inTransaction = false;
+  /** @type {import("./wipe.mjs").Query} */
+  const query = async (text, params = []) => (await client.query(text, params)).rows;
   try {
-    await client.query("begin");
-    inTransaction = true;
-    await client.query("lock table upload_chunks in share row exclusive mode");
-    const due = await wipeDue(async (text, params = []) => {
-      const result = await client.query(text, params);
-      return result.rows;
+    // Wait at most a few seconds for any one row; a busy row is retried on
+    // the next run instead of holding this job up.
+    await client.query("set lock_timeout = '5s'");
+    const due = await expireDue({
+      query,
+      transaction: async (run) => {
+        await client.query("begin");
+        try {
+          const result = await run(query);
+          await client.query("commit");
+          return result;
+        } catch (err) {
+          await client.query("rollback").catch(() => undefined);
+          throw err;
+        }
+      },
     });
-    await client.query("commit");
-    inTransaction = false;
     const tables = [];
     if (due.uploads > 0 || due.sessions > 0) tables.push("upload_chunks", "upload_sessions");
     if (due.batches > 0 || due.legacy > 0) {
@@ -50,15 +59,15 @@ async function main() {
       await client.query(`VACUUM ${table}`);
     }
     const removed = due.batches + due.legacy + due.uploads + due.sessions + due.grants;
+    if (due.skipped > 0) {
+      console.log(`[expire] skipped ${due.skipped} busy item(s); they are retried on the next run.`);
+    }
     if (removed > 0) {
       console.log(
         `[expire] removed ${due.batches} expired or used-up seal(s), ${due.legacy} legacy file(s), ${due.uploads} abandoned upload chunk(s), ${due.sessions} upload session(s), and ${due.grants} expired ticket(s).`,
       );
     }
     return 0;
-  } catch (err) {
-    if (inTransaction) await client.query("rollback").catch(() => undefined);
-    throw err;
   } finally {
     client.release();
     await pool.end();

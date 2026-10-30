@@ -12,6 +12,11 @@
  */
 
 /** @typedef {(text: string, params?: unknown[]) => Promise<Array<Record<string, unknown>>>} Query */
+/**
+ * A connection that can run single statements (each in its own implicit
+ * transaction) and explicit transactions.
+ * @typedef {{ query: Query, transaction: <T>(run: (query: Query) => Promise<T>) => Promise<T> }} Db
+ */
 /** @typedef {(done: number, total: number) => void} Progress */
 
 export const SECRET_TABLES = [
@@ -199,17 +204,28 @@ export async function wipeUpload(query, uploadId) {
   return removed;
 }
 
+const BATCH_IS_DUE = `(
+  b.expires_at <= now()
+  or (
+    b.download_count >= b.max_downloads
+    and not exists (
+      select 1 from batch_grants g where g.batch_id = b.id and g.expires_at > now()
+    )
+  )
+)`;
+
 const DUE_BATCHES = `
   select b.id from sealed_batches b
-  where b.expires_at <= now()
-     or (
-       b.download_count >= b.max_downloads
-       and not exists (
-         select 1 from batch_grants g where g.batch_id = b.id and g.expires_at > now()
-       )
-     )
+  where ${BATCH_IS_DUE}
   order by b.expires_at
 `;
+
+const UPLOAD_IS_DUE = `(
+  state <> 'pending'
+  or created_at < now() - interval '12 hours'
+  or (had_chunks = false and updated_at < now() - interval '5 minutes')
+  or (had_chunks = true and updated_at < now() - interval '2 hours')
+)`;
 
 const DUE_LEGACY = `
   select id from sealed_files
@@ -248,10 +264,7 @@ export async function wipeDue(query) {
 export async function wipeAbandonedUploads(query) {
   const sessions = await query(
     `select id from upload_sessions
-     where state <> 'pending'
-        or created_at < now() - interval '12 hours'
-        or (had_chunks = false and updated_at < now() - interval '5 minutes')
-        or (had_chunks = true and updated_at < now() - interval '2 hours')
+     where ${UPLOAD_IS_DUE}
      order by updated_at
      for update`,
   );
@@ -332,4 +345,120 @@ export async function wipeEverything(query, onProgress) {
   await query("delete from unlock_attempts");
 
   return { chunks: chunkCount, files: fileCount, batches: batchCount, uploads: uploadCount };
+}
+
+/**
+ * The scheduled expiry pass. Unlike wipeDue it never holds one long
+ * transaction: each upload piece is wiped in its own short transaction, and
+ * each seal in its own. No table lock is taken, so uploads, unlocks, and
+ * downloads keep running however much there is to delete. Deleting only ever
+ * lowers usage, so the upload quota needs no lock against it.
+ *
+ * Every item is re-checked under its row lock before it is wiped, so a seal or
+ * upload that became active again after the scan is left alone. An item whose
+ * row is busy (lock timeout, deadlock, statement timeout) is skipped and left
+ * for the next run, so one busy row never holds up the rest.
+ * @param {Db} db
+ * @returns {Promise<{ uploads: number, sessions: number, batches: number, legacy: number, grants: number, skipped: number }>}
+ */
+export async function expireDue(db) {
+  let chunks = 0;
+  let sessions = 0;
+  let skipped = 0;
+  /**
+   * @param {() => Promise<number>} work
+   * @returns {Promise<number>}
+   */
+  const unlessBusy = async (work) => {
+    try {
+      return await work();
+    } catch (err) {
+      const code = /** @type {{ code?: unknown }} */ (err)?.code;
+      if (code === "55P03" || code === "40P01" || code === "57014") {
+        skipped += 1;
+        return 0;
+      }
+      throw err;
+    }
+  };
+  const dueSessions = await db.query(`select id from upload_sessions where ${UPLOAD_IS_DUE} order by updated_at`);
+  for (const row of dueSessions) {
+    const id = String(row.id);
+    sessions += await unlessBusy(async () => {
+      // Close the upload first. A chunk or finish request that is already
+      // running holds this row, so this waits for it and then re-checks.
+      const closed = await db.query(
+        `update upload_sessions
+         set state = case when state = 'pending' then 'cancelled' else state end
+         where id = $1 and ${UPLOAD_IS_DUE}
+         returning id`,
+        [id],
+      );
+      if (closed.length === 0) return 0;
+      const pieces = await db.query(
+        "select file_index, chunk_index from upload_chunks where upload_id = $1 order by file_index, chunk_index",
+        [id],
+      );
+      for (const piece of pieces) {
+        chunks += await db.transaction(async (query) => {
+          await changed(query, SQL.ZERO_ONE_UPLOAD, [id, piece.file_index, piece.chunk_index]);
+          return changed(query, SQL.DELETE_ONE_UPLOAD, [id, piece.file_index, piece.chunk_index]);
+        });
+      }
+      await db.transaction(async (query) => {
+        await changed(query, SQL.ZERO_UPLOAD_SESSION, [id]);
+        await changed(query, SQL.DELETE_UPLOAD_SESSION, [id]);
+      });
+      return 1;
+    });
+  }
+  const orphans = await db.query(
+    `select c.upload_id, c.file_index, c.chunk_index
+     from upload_chunks c
+     where c.created_at < now() - interval '2 hours'
+       and not exists (select 1 from upload_sessions s where s.id = c.upload_id)
+     order by c.created_at`,
+  );
+  for (const row of orphans) {
+    chunks += await unlessBusy(() =>
+      db.transaction(async (query) => {
+        await changed(query, SQL.ZERO_ONE_UPLOAD, [row.upload_id, row.file_index, row.chunk_index]);
+        return changed(query, SQL.DELETE_ONE_UPLOAD, [row.upload_id, row.file_index, row.chunk_index]);
+      }),
+    );
+  }
+
+  let batches = 0;
+  for (const row of await db.query(DUE_BATCHES)) {
+    const id = String(row.id);
+    batches += await unlessBusy(() =>
+      db.transaction(async (query) => {
+        const still = await query(`select b.id from sealed_batches b where b.id = $1 and ${BATCH_IS_DUE} for update`, [id]);
+        if (still.length === 0) return 0;
+        await wipeBatch(query, id);
+        return 1;
+      }),
+    );
+  }
+
+  let legacy = 0;
+  for (const row of await db.query(DUE_LEGACY)) {
+    const id = String(row.id);
+    legacy += await unlessBusy(() =>
+      db.transaction(async (query) => {
+        const still = await query(
+          `select id from sealed_files
+           where id = $1 and batch_id is null and (expires_at <= now() or download_count >= max_downloads)
+           for update`,
+          [id],
+        );
+        if (still.length === 0) return 0;
+        await wipeFile(query, id);
+        return 1;
+      }),
+    );
+  }
+
+  const grants = await unlessBusy(() => changed(db.query, SQL.DELETE_EXPIRED_GRANTS));
+  return { uploads: chunks, sessions, batches, legacy, grants, skipped };
 }

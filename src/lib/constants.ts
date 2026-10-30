@@ -35,8 +35,33 @@ export const MAX_CHUNKS_TOTAL = MAX_CHUNKS_PER_FILE + MAX_BATCH_FILES;
  */
 export const MAX_FETCH_CHUNK_INDEX = Math.ceil((10 * GiB) / CHUNK_BYTES);
 
-/** Encryption format written by current clients (binds counts and positions). */
+/** Associated-data format written by current clients (binds counts and positions). */
 export const AAD_VERSION = 2;
+/**
+ * Seal format current clients send at start and finish: AAD format 2 plus key
+ * derivation 2. The server refuses anything else, so a page loaded before an
+ * upgrade cannot create seals in an old format.
+ */
+export const SEAL_FORMAT = 3;
+
+/**
+ * Key derivation 2: Argon2id stretches the password with one random salt into
+ * a master secret, and HKDF splits that into the AES-256-GCM key and the
+ * unlock proof under different labels. The proof can never equal the key,
+ * whatever salt the server hands out. The cost settings live here, in the
+ * page, so the server cannot lower them.
+ */
+export const KDF_VERSION = 2;
+export const ARGON2_MEMORY_KIB = 64 * 1024;
+export const ARGON2_ITERATIONS = 3;
+export const ARGON2_PARALLELISM = 1;
+/**
+ * Seals made with key derivation 1 (PBKDF2) all expire within 30 days of the
+ * upgrade. After this date the page refuses to treat any seal as version 1,
+ * so a tampered server cannot downgrade a new seal to the cheaper derivation.
+ */
+// Must be at least 31 days after this release is deployed.
+export const KDF1_ACCEPTED_UNTIL = Date.parse("2026-12-15T00:00:00Z");
 
 export const MAX_ACTIVE_UPLOADS_PER_IP = 5;
 /** One client network's share: one full seal plus row overhead. */
@@ -65,6 +90,9 @@ export const GRANT_FETCH_FACTOR = 2;
 export const GRANT_FETCH_SLACK = 8;
 
 export const MIN_PASSWORD_LENGTH = 12;
+/** Estimated guessing work, in bits, a chosen password must reach. */
+export const MIN_PASSWORD_BITS = 50;
+/** Key derivation 1 only; kept so existing seals still open. */
 export const PBKDF2_ITERATIONS = 210_000;
 export const MAX_DOWNLOADS = 100;
 export const MIN_DOWNLOADS = 1;

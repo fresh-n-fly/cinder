@@ -12,7 +12,7 @@ import {
   MAX_CHUNK_FORM_BODY_BYTES,
   MAX_SEAL_JSON_BODY_BYTES,
 } from "@/lib/constants";
-import { clientIp, errorStatus, isJsonContentType, readFormBody, readJsonBody } from "@/lib/http.server";
+import { clientIp, errorResponse, isJsonContentType, readFormBody, readJsonBody } from "@/lib/http.server";
 
 function asString(value: FormDataEntryValue | null): string {
   return typeof value === "string" ? value : "";
@@ -89,8 +89,7 @@ export const Route = createFileRoute("/api/seal")({
           });
           return Response.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
         } catch (err) {
-          const message = err instanceof Error ? err.message : "Could not seal the files.";
-          return Response.json({ error: message }, { status: errorStatus(message) });
+          return errorResponse(err, "Could not seal the files.");
         }
       },
     },

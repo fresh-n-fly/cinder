@@ -11,6 +11,7 @@ import {
   GRANT_FETCH_FACTOR,
   GRANT_FETCH_SLACK,
   GRANT_TTL_MS,
+  KDF_VERSION,
   MAX_ACTIVE_UPLOADS_PER_IP,
   MAX_BATCH_BYTES,
   MAX_BATCH_FILES,
@@ -31,15 +32,18 @@ import {
   MIN_DOWNLOADS,
   MIN_TTL_MS,
   NAME_PAD_BYTES,
+  SEAL_FORMAT,
   UPLOAD_TTL_MS,
 } from "@/lib/constants";
 import { chunkCountFor, formatBytes } from "@/lib/files";
 import { clientKeyFor } from "@/lib/client-key.server";
-import { dbSource, getSql, type Sql } from "@/lib/db";
-import { SECRET_TABLES, wipeBatch, wipeDue, wipeFile } from "../../scripts/wipe.mjs";
+import { dbSource, getSql, getUploadSql, type Sql } from "@/lib/db";
+import { PublicError } from "@/lib/errors";
+import { SECRET_TABLES, expireDue, wipeBatch, wipeFile } from "../../scripts/wipe.mjs";
 
 export type BatchMeta = {
   id: string;
+  kdf: number;
   saltAuth: string;
   expiresAt: string;
   maxDownloads: number;
@@ -50,6 +54,7 @@ export type BatchMeta = {
 
 type BatchRow = {
   id: string;
+  kdf: number | null;
   salt_auth: string;
   auth_hash: string;
   salt_enc: string;
@@ -100,7 +105,7 @@ const CLIENT_LOCKED_ERROR = "Too many incorrect passwords from this connection."
 const GONE_ERROR = "This file is gone.";
 
 /** Quota and capacity refusals: the upload stays intact so it can be retried. */
-class CapacityError extends Error {}
+class CapacityError extends PublicError {}
 
 function sha256Bytes(data: Buffer): Buffer {
   return createHash("sha256").update(data).digest();
@@ -144,7 +149,7 @@ function asBytes(value: unknown): Buffer {
     if (value.startsWith("\\x")) return Buffer.from(value.slice(2), "hex");
     return Buffer.from(value, "base64");
   }
-  throw new Error("Missing chunk.");
+  throw new PublicError("Missing chunk.");
 }
 
 function sessionExpired(session: UploadSessionRow): boolean {
@@ -245,6 +250,19 @@ const secretTables = new Set<string>(SECRET_TABLES);
 let vacuumChain: Promise<void> = Promise.resolve();
 let pgliteUploadQuotaChain: Promise<void> = Promise.resolve();
 
+/**
+ * A cheap, lock-free check that an upload exists and is still open. Every
+ * upload request runs it before queueing on the quota lock, so requests for
+ * random or finished uploads never wait in that queue.
+ */
+async function pendingUploadExists(sql: Sql, uploadId: string): Promise<boolean> {
+  const rows = await sql<{ n: number }>`
+    select count(*)::float8 as n from upload_sessions
+    where id = ${uploadId} and state = 'pending'
+  `;
+  return asNumber(rows[0]?.n) > 0;
+}
+
 async function withUploadQuotaLock<T>(sql: Sql, run: (lockedSql: Sql) => Promise<T>): Promise<T> {
   if (dbSource === "pglite") {
     const previous = pgliteUploadQuotaChain;
@@ -261,9 +279,12 @@ async function withUploadQuotaLock<T>(sql: Sql, run: (lockedSql: Sql) => Promise
   }
 
   return sql.transaction(async (lockedSql) => {
-    // Every new stored byte enters through upload_chunks, so serializing this
-    // table makes the quota check and write one atomic operation across workers.
-    await lockedSql.query("lock table upload_chunks in share row exclusive mode");
+    // Every new stored byte enters through an upload request, so serializing
+    // those makes the quota check and write one atomic operation across
+    // workers. An advisory lock serializes only upload requests: deletes,
+    // VACUUM, unlocks, and downloads never wait on it. The wait is bounded by
+    // the upload pool's lock_timeout.
+    await lockedSql.query("select pg_advisory_xact_lock(hashtext('cinder:upload-quota'))");
     return run(lockedSql);
   });
 }
@@ -294,11 +315,9 @@ async function vacuumTables(sql: Sql, tables: readonly string[]): Promise<void> 
 
 export async function purgeExpired(): Promise<void> {
   const sql = await getSql();
-  const due = await sql.transaction(async (lockedSql) => {
-    if (dbSource !== "pglite") {
-      await lockedSql.query("lock table upload_chunks in share row exclusive mode");
-    }
-    return wipeDue(asQuery(lockedSql));
+  const due = await expireDue({
+    query: asQuery(sql),
+    transaction: (run) => sql.transaction((tx) => run(asQuery(tx))),
   });
   const tables: string[] = [];
   if (due.uploads > 0 || due.sessions > 0) tables.push("upload_chunks", "upload_sessions");
@@ -324,7 +343,7 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
   const sql = await getSql();
 
   const batches = await sql<BatchRow>`
-    select id, salt_auth, auth_hash, salt_enc, expires_at::text as expires_at,
+    select id, kdf, salt_auth, auth_hash, salt_enc, expires_at::text as expires_at,
            max_downloads, download_count, failed_attempts
     from sealed_batches
     where id = ${id}
@@ -343,6 +362,7 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
     }
     return {
       id: batch.id,
+      kdf: batch.kdf ?? 1,
       saltAuth: batch.salt_auth,
       expiresAt: toIso(batch.expires_at),
       maxDownloads: batch.max_downloads,
@@ -363,6 +383,7 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
   if (isExpired(toIso(file.expires_at)) || remainingOf(file) <= 0) return null;
   return {
     id: file.id,
+    kdf: 1,
     saltAuth: file.salt_auth,
     expiresAt: toIso(file.expires_at),
     maxDownloads: file.max_downloads,
@@ -372,17 +393,19 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
   };
 }
 
+const OUT_OF_DATE = "This page is out of date. Reload it and seal the files again.";
+
 /** Requests without a usable client address share one bucket instead of skipping limits. */
 const UNATTRIBUTED = "unattributed";
 
 export async function startUploadSession(clientIp: string | null, format: number): Promise<{ uploadId: string }> {
   // Refuse an out-of-date page before it uploads anything, not after.
-  if (format !== AAD_VERSION) throw new Error("This page is out of date. Reload it and seal the files again.");
+  if (format !== SEAL_FORMAT) throw new PublicError(OUT_OF_DATE);
   const uploadId = randomBytes(16).toString("hex");
   const clientKey = clientKeyFor(clientIp) ?? UNATTRIBUTED;
-  const sql = await getSql();
+  const sql = await getUploadSql();
   await withUploadQuotaLock(sql, async (lockedSql) => {
-    if (clientKey) {
+    {
       const now = Date.now();
       const lifetimeCutoff = new Date(now - MAX_UPLOAD_LIFETIME_MS).toISOString();
       const emptyCutoff = new Date(now - EMPTY_UPLOAD_TTL_MS).toISOString();
@@ -427,12 +450,20 @@ async function markUploadForCleanup(sql: Sql, uploadId: string, state: "finished
 }
 
 async function discardUpload(uploadId: string): Promise<void> {
-  const sql = await getSql();
-  await withUploadQuotaLock(sql, (lockedSql) => markUploadForCleanup(lockedSql, uploadId, "cancelled"));
+  const sql = await getUploadSql();
+  // Only the session row is locked: marking an upload for cleanup adds no
+  // bytes, so it does not need the quota lock.
+  await sql.transaction(async (tx) => {
+    const rows = await tx<{ id: string }>`
+      select id from upload_sessions where id = ${uploadId} and state = 'pending' for update
+    `;
+    if (rows[0]) await markUploadForCleanup(tx, uploadId, "cancelled");
+  });
 }
 
 export async function cancelUpload(uploadId: string): Promise<void> {
   if (!isHex(uploadId, 32)) return;
+  if (!(await pendingUploadExists(await getUploadSql(), uploadId))) return;
   await discardUpload(uploadId);
 }
 
@@ -443,26 +474,27 @@ export async function storeChunk(input: {
   iv: string;
   payload: Buffer;
 }): Promise<void> {
-  if (!isHex(input.uploadId, 32)) throw new Error("Invalid upload.");
-  if (!isHex(input.iv, 24)) throw new Error("Encryption metadata is invalid.");
+  if (!isHex(input.uploadId, 32)) throw new PublicError("Invalid upload.");
+  if (!isHex(input.iv, 24)) throw new PublicError("Encryption metadata is invalid.");
   if (
     !Number.isInteger(input.fileIndex) ||
     input.fileIndex < 0 ||
     input.fileIndex >= MAX_BATCH_FILES
   ) {
-    throw new Error("Invalid file index.");
+    throw new PublicError("Invalid file index.");
   }
   if (
     !Number.isInteger(input.chunkIndex) ||
     input.chunkIndex < 0 ||
     input.chunkIndex >= MAX_CHUNKS_PER_FILE
   ) {
-    throw new Error("Invalid chunk.");
+    throw new PublicError("Invalid chunk.");
   }
   if (input.payload.length <= GCM_TAG_BYTES || input.payload.length > MAX_CHUNK_BYTES) {
-    throw new Error("Chunk is too large.");
+    throw new PublicError("Chunk is too large.");
   }
-  const sql = await getSql();
+  const sql = await getUploadSql();
+  if (!(await pendingUploadExists(sql, input.uploadId))) throw new PublicError("Invalid upload.");
   let discard = false;
   try {
     await withUploadQuotaLock(sql, async (lockedSql) => {
@@ -474,10 +506,10 @@ export async function storeChunk(input: {
         for update
       `;
       const session = sessions[0];
-      if (!session || session.state !== "pending") throw new Error("Invalid upload.");
+      if (!session || session.state !== "pending") throw new PublicError("Invalid upload.");
       if (sessionExpired(session)) {
         discard = true;
-        throw new Error("Upload expired.");
+        throw new PublicError("Upload expired.");
       }
       const existing = await lockedSql<{ n: number }>`
         select count(*)::float8 as n from upload_chunks
@@ -486,7 +518,7 @@ export async function storeChunk(input: {
       `;
       if (asNumber(existing[0]?.n) >= MAX_CHUNKS_TOTAL) {
         discard = true;
-        throw new Error("Invalid chunk.");
+        throw new PublicError("Invalid chunk.");
       }
 
       // Every chunk but the last of a file is a full slice. A short chunk is
@@ -503,14 +535,14 @@ export async function storeChunk(input: {
         where upload_id = ${input.uploadId} and file_index = ${input.fileIndex}
       `;
       const counts = shape[0];
-      if (asNumber(counts?.same) !== 0) throw new Error("Chunk already uploaded.");
+      if (asNumber(counts?.same) !== 0) throw new PublicError("Chunk already uploaded.");
       const isShort = input.payload.length < MAX_CHUNK_BYTES;
       const badShape = isShort
         ? asNumber(counts?.short_any) > 0 || asNumber(counts?.above) > 0
         : asNumber(counts?.short_below) > 0;
       if (badShape) {
         discard = true;
-        throw new Error("Invalid chunk.");
+        throw new PublicError("Invalid chunk.");
       }
 
       if (session.client_ip && (await clientStoredChunkCount(lockedSql, session.client_ip)) >= MAX_CLIENT_STORED_CHUNKS) {
@@ -533,7 +565,7 @@ export async function storeChunk(input: {
       `;
     });
   } catch (err) {
-    if (discard) await discardUpload(input.uploadId);
+    if (discard && err instanceof PublicError) await discardUpload(input.uploadId);
     throw err;
   }
 }
@@ -564,8 +596,9 @@ const MIME_CT_HEX = (MIME_PAD_BYTES + GCM_TAG_BYTES) * 2;
 
 export function validateFinishInput(input: FinishInput): string | null {
   if (!isHex(input.uploadId, 32)) return "Invalid upload.";
-  if (input.format !== AAD_VERSION) return "This page is out of date. Reload it and seal the files again.";
-  if (!isHex(input.saltEnc, 32) || !isHex(input.saltAuth, 32) || !isHex(input.authHash, 64)) {
+  if (input.format !== SEAL_FORMAT) return OUT_OF_DATE;
+  // Key derivation 2 uses one salt for the key and the proof.
+  if (!isHex(input.saltEnc, 32) || input.saltAuth !== input.saltEnc || !isHex(input.authHash, 64)) {
     return "Encryption metadata is invalid.";
   }
   if (
@@ -620,8 +653,9 @@ export function validateFinishInput(input: FinishInput): string | null {
 
 export async function finishUpload(input: FinishInput): Promise<{ id: string }> {
   const error = validateFinishInput(input);
-  if (error) throw new Error(error);
-  const sql = await getSql();
+  if (error) throw new PublicError(error);
+  const sql = await getUploadSql();
+  if (!(await pendingUploadExists(sql, input.uploadId))) throw new PublicError("Invalid upload.");
   let discard = false;
   try {
     return await withUploadQuotaLock(sql, async (lockedSql) => {
@@ -633,9 +667,9 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
         for update
       `;
       const session = sessions[0];
-      if (!session || session.state !== "pending") throw new Error("Invalid upload.");
+      if (!session || session.state !== "pending") throw new PublicError("Invalid upload.");
       discard = true;
-      if (sessionExpired(session)) throw new Error("Upload expired.");
+      if (sessionExpired(session)) throw new PublicError("Upload expired.");
 
       let uploadPlainBytes = 0;
       let uploadCipherBytes = 0;
@@ -650,7 +684,7 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
         uploadedFiles.length !== expectedFiles.size ||
         uploadedFiles.some((file) => !expectedFiles.has(file.file_index))
       ) {
-        throw new Error("Upload was incomplete.");
+        throw new PublicError("Upload was incomplete.");
       }
       for (const file of input.files) {
         const chunks = await lockedSql<{ chunk_index: number; len: number; iv: string }>`
@@ -659,22 +693,22 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
           where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
           order by chunk_index
         `;
-        if (chunks.length !== file.chunkCount) throw new Error("Upload was incomplete.");
+        if (chunks.length !== file.chunkCount) throw new PublicError("Upload was incomplete.");
         for (let index = 0; index < file.chunkCount; index += 1) {
           const chunk = chunks[index];
           if (!chunk || chunk.chunk_index !== index || !isHex(chunk.iv, 24)) {
-            throw new Error("Upload was incomplete.");
+            throw new PublicError("Upload was incomplete.");
           }
           const len = asNumber(chunk.len);
-          if (len <= GCM_TAG_BYTES || len > MAX_CHUNK_BYTES) throw new Error("Encrypted payload is invalid.");
+          if (len <= GCM_TAG_BYTES || len > MAX_CHUNK_BYTES) throw new PublicError("Encrypted payload is invalid.");
           if (index < file.chunkCount - 1 && len !== MAX_CHUNK_BYTES) {
-            throw new Error("Encrypted payload is invalid.");
+            throw new PublicError("Encrypted payload is invalid.");
           }
           uploadCipherBytes += len;
           uploadChunkCount += 1;
           uploadPlainBytes += len - GCM_TAG_BYTES;
           if (uploadPlainBytes > MAX_BATCH_BYTES) {
-            throw new Error(`One seal can hold at most ${formatBytes(MAX_BATCH_BYTES)}.`);
+            throw new PublicError(`One seal can hold at most ${formatBytes(MAX_BATCH_BYTES)}.`);
           }
         }
       }
@@ -704,9 +738,9 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
       const expires = new Date(input.expiresAt).toISOString();
       await lockedSql`
         insert into sealed_batches (
-          id, salt_auth, auth_hash, salt_enc, expires_at, max_downloads, client_key
+          id, kdf, salt_auth, auth_hash, salt_enc, expires_at, max_downloads, client_key
         ) values (
-          ${batchId}, ${input.saltAuth}, ${input.authHash}, ${input.saltEnc},
+          ${batchId}, ${KDF_VERSION}, ${input.saltAuth}, ${input.authHash}, ${input.saltEnc},
           ${expires}::timestamptz, ${input.maxDownloads}, ${session.client_ip}
         )
       `;
@@ -739,16 +773,61 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
       return { id: batchId };
     });
   } catch (err) {
-    if (discard && !(err instanceof CapacityError)) await discardUpload(input.uploadId);
+    // Only a refused upload is thrown away. Capacity refusals and transient
+    // failures (lock or statement timeouts) keep it so the page can retry.
+    if (discard && err instanceof PublicError && !(err instanceof CapacityError)) {
+      await discardUpload(input.uploadId);
+    }
     throw err;
   }
 }
 
-function verifierMatches(verifierHex: string, authHash: string): boolean {
-  if (!isHex(verifierHex, 64) || !isHex(authHash, 64)) return false;
-  const incoming = sha256Bytes(Buffer.from(verifierHex, "hex"));
+function constantTimeEqual(a: Buffer, b: Buffer): boolean {
+  return a.length === 32 && b.length === 32 && timingSafeEqual(a, b);
+}
+
+/**
+ * What the browser sent to prove it knows the password.
+ * - verifier2: key derivation 2 (HKDF proof).
+ * - proof: key derivation 1, SHA-256 of the PBKDF2 verifier (current pages).
+ * - verifier: key derivation 1, the PBKDF2 verifier itself (pages loaded before the upgrade).
+ */
+export type UnlockProof = { verifier: string; proof: string; verifier2: string };
+
+function hasProof(input: UnlockProof): boolean {
+  return isHex(input.verifier, 64) || isHex(input.proof, 64) || isHex(input.verifier2, 64);
+}
+
+const STALE_PAGE = "This page is out of date. Reload it and enter the password again.";
+
+/** A page from before the upgrade sends only `verifier`; for a version-2 seal that is not a guess to count. */
+function isStalePage(kdf: number, input: UnlockProof): boolean {
+  return kdf >= 2 && !isHex(input.verifier2, 64);
+}
+
+/**
+ * Check an unlock against the stored SHA-256 of the proof.
+ *
+ * - Key derivation 2: the browser sends the HKDF proof ("verifier2") and the
+ *   server hashes it, so a copy of the database alone cannot unlock.
+ * - Key derivation 1: the PBKDF2 proof could be turned into the AES key by a
+ *   tampered server, so current pages send only its SHA-256 ("proof"), which
+ *   is compared directly. Someone holding a database copy could replay that
+ *   hash to get a download ticket, but a ticket only serves ciphertext that
+ *   copy already contains. Pages loaded before the upgrade still send the raw
+ *   verifier, which is accepted for version 1 only.
+ */
+function proofMatches(kdf: number, input: UnlockProof, authHash: string): boolean {
+  if (!isHex(authHash, 64)) return false;
   const stored = Buffer.from(authHash, "hex");
-  return incoming.length === stored.length && stored.length === 32 && timingSafeEqual(incoming, stored);
+  if (kdf >= 2) {
+    return isHex(input.verifier2, 64) && constantTimeEqual(sha256Bytes(Buffer.from(input.verifier2, "hex")), stored);
+  }
+  if (isHex(input.proof, 64)) return constantTimeEqual(Buffer.from(input.proof, "hex"), stored);
+  if (isHex(input.verifier, 64)) {
+    return constantTimeEqual(sha256Bytes(Buffer.from(input.verifier, "hex")), stored);
+  }
+  return false;
 }
 
 export type UnlockFile = {
@@ -887,22 +966,22 @@ async function issueGrant(tx: Sql, batchId: string, files: UnlockFile[]): Promis
 
 export async function unlockBatch(
   id: string,
-  verifierHex: string,
+  input: UnlockProof,
   clientIp: string | null,
 ): Promise<UnlockResult> {
   if (!isHex(id, 32)) return { ok: false, error: GONE_ERROR, status: 404 };
-  if (!isHex(verifierHex, 64)) return { ok: false, error: "Incorrect password.", status: 401 };
+  if (!hasProof(input)) return { ok: false, error: "Incorrect password.", status: 401 };
   const clientKey = clientKeyFor(clientIp) ?? UNATTRIBUTED;
 
   const sql = await getSql();
   const exists = await sql<{ n: number }>`select count(*)::float8 as n from sealed_batches where id = ${id}`;
-  if (asNumber(exists[0]?.n) === 0) return unlockLegacyFile(id, verifierHex, clientKey);
+  if (asNumber(exists[0]?.n) === 0) return unlockLegacyFile(id, input, clientKey);
 
   // The whole check runs with the seal's row locked, so parallel guesses are
   // checked one at a time against the attempt budgets they are counted in.
   return sql.transaction(async (tx): Promise<UnlockResult> => {
     const batches = await tx<BatchRow>`
-      select id, salt_auth, auth_hash, salt_enc, expires_at::text as expires_at,
+      select id, kdf, salt_auth, auth_hash, salt_enc, expires_at::text as expires_at,
              max_downloads, download_count, failed_attempts
       from sealed_batches
       where id = ${id} and expires_at > now()
@@ -920,7 +999,8 @@ export async function unlockBatch(
     if ((await clientFailures(tx, id, clientKey)) >= MAX_FAILED_ATTEMPTS_PER_CLIENT) {
       return { ok: false, error: CLIENT_LOCKED_ERROR, status: 429, remainingAttempts: 0 };
     }
-    if (!verifierMatches(verifierHex, batch.auth_hash)) {
+    if (isStalePage(batch.kdf ?? 1, input)) return { ok: false, error: STALE_PAGE, status: 409 };
+    if (!proofMatches(batch.kdf ?? 1, input, batch.auth_hash)) {
       return recordFailedUnlock(tx, "batch", id, clientKey);
     }
 
@@ -964,7 +1044,7 @@ export async function unlockBatch(
   });
 }
 
-async function unlockLegacyFile(id: string, verifierHex: string, clientKey: string): Promise<UnlockResult> {
+async function unlockLegacyFile(id: string, input: UnlockProof, clientKey: string): Promise<UnlockResult> {
   const sql = await getSql();
   return sql.transaction(async (tx): Promise<UnlockResult> => {
     const rows = await tx<FileRow>`
@@ -987,7 +1067,7 @@ async function unlockLegacyFile(id: string, verifierHex: string, clientKey: stri
     if ((await clientFailures(tx, id, clientKey)) >= MAX_FAILED_ATTEMPTS_PER_CLIENT) {
       return { ok: false, error: CLIENT_LOCKED_ERROR, status: 429, remainingAttempts: 0 };
     }
-    if (!verifierMatches(verifierHex, row.auth_hash)) {
+    if (!proofMatches(1, input, row.auth_hash)) {
       return recordFailedUnlock(tx, "legacy", id, clientKey);
     }
 
@@ -1046,55 +1126,59 @@ export async function fetchFileChunk(
     return { ok: false, error: "Invalid chunk.", status: 400 };
   }
   const sql = await getSql();
-  // Each fetch spends one unit of this unlock's budget, and only while both
-  // the ticket and the seal are unexpired.
-  const grants = await sql<{ batch_id: string }>`
-    update batch_grants g
-    set fetches = g.fetches + 1
-    from sealed_batches b
-    where g.token_hash = ${sha256Hex(ticket)}
-      and b.id = g.batch_id
-      and g.expires_at > now()
-      and b.expires_at > now()
-      and g.fetches < g.fetch_limit
-    returning g.batch_id
-  `;
-  const batchId = grants[0]?.batch_id;
-  if (!batchId) {
-    return { ok: false, error: "This session expired. Unlock again.", status: 401 };
-  }
+  // One transaction: if reading the piece fails (a timeout, a dropped
+  // connection), the fetch is not charged, so the page can safely retry.
+  return sql.transaction(async (tx): Promise<FetchResult> => {
+    // Each fetch spends one unit of this unlock's budget, and only while both
+    // the ticket and the seal are unexpired.
+    const grants = await tx<{ batch_id: string }>`
+      update batch_grants g
+      set fetches = g.fetches + 1
+      from sealed_batches b
+      where g.token_hash = ${sha256Hex(ticket)}
+        and b.id = g.batch_id
+        and g.expires_at > now()
+        and b.expires_at > now()
+        and g.fetches < g.fetch_limit
+      returning g.batch_id
+    `;
+    const batchId = grants[0]?.batch_id;
+    if (!batchId) {
+      return { ok: false, error: "This session expired. Unlock again.", status: 401 };
+    }
 
-  const chunks = await sql<{ iv: string; payload: unknown; chunk_count: number | null }>`
-    select c.iv, c.payload, f.chunk_count
-    from sealed_file_chunks c
-    join sealed_files f on f.id = c.file_id
-    where c.file_id = ${fileId}
-      and c.chunk_index = ${chunkIndex}
-      and f.batch_id = ${batchId}
-  `;
-  const chunk = chunks[0];
-  if (chunk) {
-    const bytes = asBytes(chunk.payload);
-    const count = chunk.chunk_count ?? 0;
-    return {
-      ok: true,
-      chunk: bytes,
-      iv: chunk.iv,
-      last: count > 0 ? chunkIndex + 1 >= count : false,
-    };
-  }
+    const chunks = await tx<{ iv: string; payload: unknown; chunk_count: number | null }>`
+      select c.iv, c.payload, f.chunk_count
+      from sealed_file_chunks c
+      join sealed_files f on f.id = c.file_id
+      where c.file_id = ${fileId}
+        and c.chunk_index = ${chunkIndex}
+        and f.batch_id = ${batchId}
+    `;
+    const chunk = chunks[0];
+    if (chunk) {
+      const bytes = asBytes(chunk.payload);
+      const count = chunk.chunk_count ?? 0;
+      return {
+        ok: true,
+        chunk: bytes,
+        iv: chunk.iv,
+        last: count > 0 ? chunkIndex + 1 >= count : false,
+      };
+    }
 
-  const files = await sql<Pick<FileRow, "id" | "ciphertext" | "iv">>`
-    select id, ciphertext, iv from sealed_files
-    where id = ${fileId} and batch_id = ${batchId}
-  `;
-  const file = files[0];
-  if (!file?.ciphertext || !file.iv) {
-    return { ok: false, error: GONE_ERROR, status: 404 };
-  }
-  const raw = Buffer.from(file.ciphertext, "base64");
-  const start = chunkIndex * CHUNK_BYTES;
-  if (start >= raw.length) return { ok: false, error: "Invalid chunk.", status: 400 };
-  const end = Math.min(raw.length, start + CHUNK_BYTES);
-  return { ok: true, chunk: raw.subarray(start, end), iv: file.iv, last: end >= raw.length };
+    const files = await tx<Pick<FileRow, "id" | "ciphertext" | "iv">>`
+      select id, ciphertext, iv from sealed_files
+      where id = ${fileId} and batch_id = ${batchId}
+    `;
+    const file = files[0];
+    if (!file?.ciphertext || !file.iv) {
+      return { ok: false, error: GONE_ERROR, status: 404 };
+    }
+    const raw = Buffer.from(file.ciphertext, "base64");
+    const start = chunkIndex * CHUNK_BYTES;
+    if (start >= raw.length) return { ok: false, error: "Invalid chunk.", status: 400 };
+    const end = Math.min(raw.length, start + CHUNK_BYTES);
+    return { ok: true, chunk: raw.subarray(start, end), iv: file.iv, last: end >= raw.length };
+  });
 }

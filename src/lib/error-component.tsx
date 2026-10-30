@@ -1,9 +1,9 @@
 import type { ErrorComponentProps } from "@tanstack/react-router";
 import { TriangleAlert } from "lucide-react";
 
-export function AppErrorComponent({ error }: ErrorComponentProps) {
-  const message = error instanceof Error ? error.message : "";
-
+// Route errors can come from the server (database or driver failures), so
+// their text is never shown.
+export function AppErrorComponent(_props: ErrorComponentProps) {
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-3 bg-bg px-6 text-center text-fg">
       <span className="text-danger" aria-hidden="true">
@@ -11,7 +11,7 @@ export function AppErrorComponent({ error }: ErrorComponentProps) {
       </span>
       <h1 className="font-display text-2xl font-bold tracking-tight">Something went wrong</h1>
       <p className="max-w-md text-sm break-words text-muted">
-        {message || "An unexpected error occurred. Try reloading the page."}
+        An unexpected error occurred. Try reloading the page.
       </p>
     </main>
   );
