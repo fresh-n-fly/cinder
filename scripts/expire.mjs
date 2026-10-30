@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 /**
- * Delete seals that are past their expiry or download limit, and uploads
- * abandoned for more than two hours. Safe to run while Cinder is up.
- * A used-up seal is kept until its 15-minute download ticket has ended.
+ * Delete seals that are past their expiry or download limit, uploads that
+ * were abandoned or outlived their lifetime, and expired download tickets.
+ * Safe to run while Cinder is up. A used-up seal is kept until its last
+ * download ticket has ended.
+ *
+ * This job runs every minute and only uses plain VACUUM, which marks the
+ * deleted rows reusable without an exclusive lock. Rewriting the table files
+ * (VACUUM FULL) is done by scripts/compact.mjs on its own daily schedule, so
+ * nothing a visitor does can force a rewrite.
  *
  * With no DATABASE_URL, files live only in the Cinder process. This script
  * exits with an error in that case.
@@ -34,21 +40,19 @@ async function main() {
     await client.query("commit");
     inTransaction = false;
     const tables = [];
-    if (due.uploads > 0 || due.uploadVacuum > 0) tables.push("upload_chunks", "upload_sessions");
+    if (due.uploads > 0 || due.sessions > 0) tables.push("upload_chunks", "upload_sessions");
     if (due.batches > 0 || due.legacy > 0) {
-      tables.push("sealed_file_chunks", "sealed_files", "sealed_batches");
+      tables.push("sealed_file_chunks", "sealed_files", "sealed_batches", "unlock_attempts");
     }
-    for (const table of tables) {
+    if (due.grants > 0) tables.push("batch_grants");
+    for (const table of new Set(tables)) {
       if (!SECRET_TABLES.includes(table)) continue;
-      await client.query(`VACUUM FULL ${table}`);
+      await client.query(`VACUUM ${table}`);
     }
-    if (due.sessions > 0 && due.uploadVacuum === 0 && due.uploads === 0) {
-      await client.query("VACUUM upload_sessions");
-    }
-    const removed = due.batches + due.legacy + due.uploads + due.sessions;
+    const removed = due.batches + due.legacy + due.uploads + due.sessions + due.grants;
     if (removed > 0) {
       console.log(
-        `[expire] removed ${due.batches} expired or used-up seal(s), ${due.legacy} legacy file(s), ${due.uploads} abandoned upload chunk(s), and ${due.sessions} upload session(s).`,
+        `[expire] removed ${due.batches} expired or used-up seal(s), ${due.legacy} legacy file(s), ${due.uploads} abandoned upload chunk(s), ${due.sessions} upload session(s), and ${due.grants} expired ticket(s).`,
       );
     }
     return 0;

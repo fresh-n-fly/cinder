@@ -359,6 +359,11 @@ upsert_env "$PREFIX/.env" NITRO_PORT 3000
 if [[ "$replace_db_url" == 1 ]] || ! grep -q '^DATABASE_URL=postgres' "$PREFIX/.env"; then
   upsert_env "$PREFIX/.env" DATABASE_URL "$db_url"
 fi
+# Keys per-client limits on a keyed hash of the address, so stored values
+# cannot be reversed. Generated once and kept across updates.
+if ! grep -Eq '^CINDER_CLIENT_KEY_SECRET=[0-9a-fA-F]{64,}$' "$PREFIX/.env"; then
+  upsert_env "$PREFIX/.env" CINDER_CLIENT_KEY_SECRET "$(openssl rand -hex 32)"
+fi
 chown cinder:cinder "$PREFIX/.env"
 chmod 600 "$PREFIX/.env"
 db_url=$(env_get DATABASE_URL "$PREFIX/.env")
@@ -469,6 +474,14 @@ sed \
   -e "s|^Documentation=.*|Documentation=file://${PREFIX}/README.md|" \
   "$PREFIX/deploy/cinder-expire.service" > /etc/systemd/system/cinder-expire.service
 cp "$PREFIX/deploy/cinder-expire.timer" /etc/systemd/system/cinder-expire.timer
+sed \
+  -e "s|^WorkingDirectory=.*|WorkingDirectory=${PREFIX}|" \
+  -e "s|^EnvironmentFile=.*|EnvironmentFile=${PREFIX}/.env|" \
+  -e "s|^ExecStart=.*|ExecStart=${NODE_BIN} scripts/compact.mjs|" \
+  -e "s|^ReadOnlyPaths=.*|ReadOnlyPaths=${PREFIX}|" \
+  -e "s|^Documentation=.*|Documentation=file://${PREFIX}/README.md|" \
+  "$PREFIX/deploy/cinder-compact.service" > /etc/systemd/system/cinder-compact.service
+cp "$PREFIX/deploy/cinder-compact.timer" /etc/systemd/system/cinder-compact.timer
 
 say "Configuring Fail2ban."
 install -D -m 644 "$PREFIX/deploy/fail2ban/cinder-unlock.conf" /etc/fail2ban/filter.d/cinder-unlock.conf
@@ -478,10 +491,12 @@ fail2ban-client -t || die "Fail2ban rejected the Cinder jail configuration."
 systemctl daemon-reload
 systemctl enable cinder
 systemctl enable cinder-expire.timer
+systemctl enable cinder-compact.timer
 systemctl enable fail2ban
 systemctl reset-failed cinder || true
 systemctl restart cinder
 systemctl restart cinder-expire.timer
+systemctl restart cinder-compact.timer
 systemctl restart fail2ban || die "Fail2ban did not start. Check: journalctl -u fail2ban -e"
 fail2ban_ready=0
 for _ in $(seq 1 20); do
@@ -717,14 +732,21 @@ write_nginx() {
   {
     printf '%s\n' "# Written by deploy/install.sh. Run that script again to replace this file."
     printf '%s\n' "# Uploads arrive in pieces of about 4 MB. client_max_body_size must stay at least 8m."
-    printf '%s\n' "# JSON POSTs to /api/open are unlock attempts; multipart chunk downloads are not rate-limited."
+    printf '%s\n' "# Form bodies on /api/open are chunk downloads; every other body gets the strict unlock limit."
     printf '%s\n' "map \$http_content_type \$cinder_unlock_key {"
+    printf '%s\n' "    default \$binary_remote_addr;"
+    printf '%s\n' "    ~*^multipart/form-data \"\";"
+    printf '%s\n' "    ~*^application/x-www-form-urlencoded \"\";"
+    printf '%s\n' "}"
+    printf '%s\n' "# POSTs reaching the catch-all location are throttled as well."
+    printf '%s\n' "map \$request_method \$cinder_post_key {"
     printf '%s\n' "    default \"\";"
-    printf '%s\n' "    ~*^application/json \$binary_remote_addr;"
+    printf '%s\n' "    POST \$binary_remote_addr;"
     printf '%s\n' "}"
     printf '%s\n' "limit_req_zone \$cinder_unlock_key zone=cinder_unlock:10m rate=10r/m;"
     printf '%s\n' "limit_req_zone \$binary_remote_addr zone=cinder_open:10m rate=100r/s;"
     printf '%s\n' "limit_req_zone \$binary_remote_addr zone=cinder_seal:10m rate=20r/s;"
+    printf '%s\n' "limit_req_zone \$cinder_post_key zone=cinder_post:10m rate=20r/s;"
     printf '%s\n' "upstream cinder {"
     printf '%s\n' "    server 127.0.0.1:3000;"
     printf '%s\n' "    keepalive 16;"
@@ -773,6 +795,9 @@ ${le_ssl}
     add_header Cross-Origin-Opener-Policy "same-origin" always;
     add_header Cross-Origin-Resource-Policy "same-origin" always;
 
+    # The app's URL parser turns "\\" into "/"; refuse it so no path variant skips the API locations.
+    if (\$request_uri ~ "(\x5c|%5[cC])") { return 400; }
+
     client_max_body_size 8m;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
@@ -809,6 +834,9 @@ ${le_ssl}
     }
 
     location / {
+        limit_req zone=cinder_post burst=40 nodelay;
+        limit_req_status 429;
+
         proxy_pass http://cinder;
         proxy_http_version 1.1;
         proxy_set_header Host              \$host;
@@ -859,6 +887,9 @@ ${http2_line}
     add_header Cross-Origin-Opener-Policy "same-origin" always;
     add_header Cross-Origin-Resource-Policy "same-origin" always;
 
+    # The app's URL parser turns "\\" into "/"; refuse it so no path variant skips the API locations.
+    if (\$request_uri ~ "(\x5c|%5[cC])") { return 400; }
+
     client_max_body_size 8m;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
@@ -895,6 +926,9 @@ ${http2_line}
     }
 
     location / {
+        limit_req zone=cinder_post burst=40 nodelay;
+        limit_req_status 429;
+
         proxy_pass http://cinder;
         proxy_http_version 1.1;
         proxy_set_header Host              \$host;

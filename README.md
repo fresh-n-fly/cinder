@@ -10,15 +10,15 @@ This document is the operator’s guide. It covers a local try-out and a product
 
 Cinder locks the files in the browser and keeps the server from learning the password, the file names, or the file types.
 
-**The password never leaves the browser.** The sender’s password is stretched with PBKDF2-SHA-256, 210,000 times, into an AES-256-GCM key. That key encrypts each 4 MB piece of each file before upload. A second salt produces a proof the server can check. The server stores a SHA-256 of that proof and compares it with a constant-time check. A correct proof returns the encryption salt and a 15-minute download ticket. The password itself is not sent, stored, or recoverable. There is no operator account and no password reset. The minimum is 12 characters, including a number and a symbol.
+**The password never leaves the browser.** The sender’s password is stretched with PBKDF2-SHA-256, 210,000 times, into an AES-256-GCM key. That key encrypts each 4 MB piece of each file before upload. A second salt produces a proof the server can check. The server stores a SHA-256 of that proof and compares it with a constant-time check. A correct proof returns the encryption salt and a 15-minute download ticket. Every unlock gets its own ticket; the server stores only a SHA-256 of it, and a ticket allows about two passes over the seal before it stops working. The password itself is not sent, stored, or recoverable. There is no operator account and no password reset. The minimum is 12 characters, including a number and a symbol.
 
-**Names and types are locked too.** Each file name is padded to 1,024 bytes and each type to 128 bytes before encryption, so the stored length does not reveal how long the original was. Before the password is accepted, the page is told only the proof salt, the expiry, the download counters, whether the seal is locked, and how many files it holds. After a correct password, the browser decrypts the names and the file pieces. Each piece is bound to its position, so one piece cannot be swapped for another.
+**Names and types are locked too.** Each file name is padded to 1,024 bytes and each type to 128 bytes before encryption, so the stored length does not reveal how long the original was. Before the password is accepted, the page is told only the proof salt, the expiry, the download counters, whether the seal is locked, and how many files it holds. After a correct password, the browser decrypts the names and the file pieces. Each piece is bound to its position and to the number of pieces in its file, and each name and type to the file's position and the number of files in the seal. Swapping, dropping, or cutting off pieces or files makes decryption fail instead of producing a shorter file.
 
-**The link is unguessable, and use is limited.** A seal address is 32 random hex characters. The sender chooses an expiry, from 15 minutes up to 30 days, and a download count from 1 to 100. Twelve wrong passwords lock the seal until that expiry. When the expiry passes, or the downloads are used up and the 15-minute ticket has ended, a job running about once a minute overwrites the secret columns, deletes the rows, and rewrites those table files. The same wipe is available by hand with `deploy/purge.sh --yes`.
+**The link is unguessable, and use is limited.** A seal address is 32 random hex characters. The sender chooses an expiry, from 15 minutes up to 30 days, and a download count from 1 to 100. One connection (an IPv4 address, or an IPv6 /64) may get the password wrong five times; thirty wrong passwords in total lock the seal until that expiry, so locking someone else's seal takes several distinct networks. When the expiry passes, or the downloads are used up and the last download ticket has ended, a job running about once a minute overwrites the secret columns and deletes the rows. Once a day a second job rewrites the table files so the deleted rows leave the disk. The same wipe is available by hand with `deploy/purge.sh --yes`.
 
 **The host is kept small.** The installer puts PostgreSQL and the Node app on `127.0.0.1` only. Nginx is the service on ports 80 and 443; port 80 redirects to HTTPS, using an existing Let’s Encrypt certificate or a self-signed certificate. The database password is a new 48-character random value, written to `/opt/cinder/.env` mode `600`, and the install script does not print it. Download tickets are sent in the request body, and those responses are marked not to be cached.
 
-**What a database copy still shows.** Expiry, download counts, salts, the proof hash, the per-piece initialization vectors, and the byte length of each locked piece. That length is close to the original file size. A backup, the write-ahead log, and freed disk blocks can still hold ciphertext after a row is gone. Full-disk encryption is what covers those leftover blocks.
+**What a database copy still shows.** Expiry, download counts, salts, the proof hash, the per-piece initialization vectors, the byte length of each locked piece, and keyed hashes used for per-connection limits (an HMAC under a secret in `/opt/cinder/.env`, never the address itself). That length is close to the original file size. A backup, the write-ahead log, and freed disk blocks can still hold ciphertext after a row is gone. Full-disk encryption is what covers those leftover blocks.
 
 ## What you are installing
 
@@ -34,8 +34,9 @@ The application itself is this directory. Encrypted file contents live in Postgr
 Limits, as shipped:
 
 - Any file type
-- Any size per file
-- 100 files in one seal
+- 100 files and 5 GB in one seal
+- About 5 GB stored at once per connection (IPv4 address or IPv6 /64)
+- An upload must finish within 12 hours
 - 20 GB combined for everything stored on the service at once, including uploads still in progress
 - Password: at least 12 characters, with a number and a special character
 - Expiry: up to 30 days, entered as day/month/year in GMT
@@ -98,7 +99,7 @@ If `/etc/letsencrypt/live/` already contains a certificate, the installer uses t
 
 The installer does not open port 3000. If UFW is already on, it allows OpenSSH and Nginx. If UFW is off, it leaves the firewall alone. It does not delete an existing database.
 
-The generated Nginx site rate-limits JSON unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance, applies a looser limit to chunk downloads, and rate-limits `/api/seal` traffic. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
+The generated Nginx site rate-limits unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance (any body that is not a chunk-download form counts as an unlock), applies a looser limit to chunk downloads, rate-limits `/api/seal`, rate-limits every other POST, and refuses any URL containing a backslash. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
 
 To see or clear those bans:
 
@@ -333,7 +334,7 @@ sudo systemctl start nginx
 sudo bash deploy/verify.sh
 ```
 
-The script reads the database password from `/opt/cinder/.env` and does not print it. It lists what is still stored, then lists seals past their expiry, used-up seals whose download ticket has ended, uploads abandoned for more than two hours, and chunks left without a file. Exit 0 means those are gone from the live tables. A seal locked by wrong passwords, or one whose 15-minute download ticket is still valid, is supposed to remain.
+The script reads the database password from `/opt/cinder/.env` and does not print it. It lists what is still stored, then lists seals past their expiry, used-up seals whose last download ticket has ended, expired tickets, uploads that were abandoned or are older than 12 hours, and chunks left without a file. Exit 0 means those are gone from the live tables. A seal locked by wrong passwords, or one whose 15-minute download ticket is still valid, is supposed to remain.
 
 ### Purge every stored file
 
@@ -345,9 +346,11 @@ sudo bash deploy/purge.sh --yes
 
 That stops Cinder, runs the wipe, and starts Cinder again. Without `--yes` it refuses and leaves the service running.
 
-The script requires `--yes`. It overwrites each secret column with zeros, deletes the row, then runs `VACUUM FULL` on `sealed_file_chunks`, `sealed_files`, `sealed_batches`, and `upload_chunks`. `VACUUM FULL` builds a new table file that contains only the rows still present and drops the old file.
+The script requires `--yes`. It overwrites each secret column with zeros, deletes the row, then runs `VACUUM FULL` on every Cinder table. `VACUUM FULL` builds a new table file that contains only the rows still present and drops the old file.
 
-Expired seals, seals that have used their downloads, and uploads left unfinished for more than two hours are cleared on a timer, about once a minute, whether or not anyone opens the site. A used-up seal stays until its 15-minute download ticket has ended. Each pass clears every due row, then rewrites the table files that changed. That rewrite takes an exclusive lock, so uploads and downloads wait until it finishes. The installer enables `cinder-expire.timer`. Run it once by hand with `sudo systemctl start cinder-expire.service`.
+Expired seals, seals that have used their downloads, expired tickets, and uploads that were abandoned or are older than 12 hours are cleared on a timer, about once a minute, whether or not anyone opens the site. A used-up seal stays until its last download ticket has ended. Each pass zero-fills and deletes every due row, then runs plain `VACUUM`, which takes no exclusive lock. The installer enables `cinder-expire.timer`; run it by hand with `sudo systemctl start cinder-expire.service`.
+
+Once a day `cinder-compact.timer` runs `VACUUM FULL` on each Cinder table, so deleted rows also leave the table files. Each table waits at most five seconds for its lock and is skipped if busy. Run it by hand with `sudo systemctl start cinder-compact.service`. Until that rewrite, deleted rows can stay in the table files for up to about a day.
 
 Copies can remain in three places after either kind of delete:
 
@@ -408,13 +411,15 @@ A dump taken before a seal is cleared still holds that ciphertext. Keep backup r
 
 ### Disk
 
-Plan database disk for the ciphertext. New seals are stored as encrypted chunks (`bytea`), one slice per row, so a download never loads a whole file into memory. Names and types are fixed-size ciphertext, so their length is hidden. The service refuses a new upload when the estimated stored footprint, including row overhead, would pass 20 GB. Monitor `pg_database_size('cinder')`.
+Plan database disk for the ciphertext. New seals are stored as encrypted chunks (`bytea`), one slice per row, so a download never loads a whole file into memory. Names and types are fixed-size ciphertext, so their length is hidden. The service refuses a new upload when the estimated stored footprint, including row overhead, would pass 20 GB, or when one connection would hold more than about 5 GB. Monitor `pg_database_size('cinder')`.
 
 ## Security notes
 
 - Use HTTPS. The password never travels to the server. Download tickets do. File names and types do not: they are locked before upload.
 - What stays readable in the database is operational: expiry, download counters, salts, per-chunk initialization vectors, and the byte length of each locked slice. That length is required to store and serve the slice. It is a close stand-in for the original size.
-- Keep `DATABASE_URL` in `/opt/cinder/.env` with mode `600` and owner `cinder`.
+- Keep `DATABASE_URL` and `CINDER_CLIENT_KEY_SECRET` in `/opt/cinder/.env` with mode `600` and owner `cinder`. The secret keys the hashes used for per-connection limits; anyone holding it can test whether a given address made an upload or a wrong-password attempt that is still stored.
+- The app log records the client address of each counted wrong password, so Fail2ban can act on it. Set a journald retention (`MaxRetentionSec=`) that matches how long you want addresses kept.
+- Browsers without a save-file picker (Firefox, Safari) receive downloads through a small service worker (`/save-sw.js`), so decrypted files are not written to the site's storage.
 - Do not put Cinder behind a cache that stores POST bodies or `/api/open` responses.
 - There are no operator accounts and no way to recover a forgotten password. If a sender loses the password, the files cannot be opened.
 - The in-memory database is only for local trials. Production must set `DATABASE_URL`.
@@ -461,6 +466,8 @@ Check `pg_hba.conf` allows `127.0.0.1` with a password, and that the role owns t
 │   ├── cinder.service    # systemd unit for the site
 │   ├── cinder-expire.service
 │   ├── cinder-expire.timer  # deletes expired seals every minute
+│   ├── cinder-compact.service
+│   ├── cinder-compact.timer # rewrites table files once a day
 │   └── nginx.conf        # reverse proxy example
 ├── migrations/           # PostgreSQL schema
 ├── public/               # favicon and share image

@@ -1,3 +1,5 @@
+import { AAD_VERSION } from "@/lib/constants";
+
 async function readError(response: Response): Promise<string> {
   const payload = (await response.json().catch(() => ({}))) as { error?: string };
   return payload.error || "Upload failed.";
@@ -7,7 +9,7 @@ export async function startUpload(): Promise<string> {
   const response = await fetch("/api/seal", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ intent: "start" }),
+    body: JSON.stringify({ intent: "start", format: AAD_VERSION }),
   });
   const payload = (await response.json()) as { uploadId?: string; error?: string };
   if (!response.ok || !payload.uploadId) throw new Error(payload.error || "Could not start upload.");
@@ -42,6 +44,7 @@ export async function putCipherChunk(
 
 export async function finishUpload(body: {
   uploadId: string;
+  format: number;
   saltAuth: string;
   saltEnc: string;
   authHash: string;

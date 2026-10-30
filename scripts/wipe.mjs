@@ -3,7 +3,8 @@
  *
  * PostgreSQL keeps the previous row version until the table is rewritten.
  * One zero-fill followed by DELETE is the sequence that lets VACUUM FULL
- * drop the ciphertext from the live table file. A second overwrite does
+ * (scripts/compact.mjs, on its own schedule) drop the ciphertext from the
+ * live table file. A second overwrite does
  * nothing until that rewrite happens. Values larger than 16 MiB are
  * replaced with a single zero: a same-length replacement of a multi-gigabyte
  * legacy blob cannot be allocated in one UPDATE, and the old version is
@@ -19,6 +20,8 @@ export const SECRET_TABLES = [
   "sealed_batches",
   "upload_chunks",
   "upload_sessions",
+  "batch_grants",
+  "unlock_attempts",
 ];
 
 const ZERO_LIMIT = 16 * 1024 * 1024;
@@ -85,11 +88,17 @@ export const SQL = {
     set salt_auth = ${zeroText("salt_auth")},
         auth_hash = ${zeroText("auth_hash")},
         salt_enc = ${zeroText("salt_enc")},
-        grant_token = ${zeroText("grant_token")}
+        grant_token = ${zeroText("grant_token")},
+        client_key = ${zeroText("client_key")}
     where id = $1
     returning 1
   `,
   DELETE_BATCH: `delete from sealed_batches where id = $1 returning 1`,
+  // Grant rows hold only a hash of a short-lived ticket and attempt rows hold a
+  // keyed client hash in the primary key, so they are deleted, not zeroed.
+  DELETE_BATCH_GRANTS: `delete from batch_grants where batch_id = $1 returning 1`,
+  DELETE_BATCH_ATTEMPTS: `delete from unlock_attempts where batch_id = $1 returning 1`,
+  DELETE_EXPIRED_GRANTS: `delete from batch_grants where expires_at <= now() returning 1`,
   ZERO_ONE_UPLOAD: `
     update upload_chunks
     set payload = ${zeroText("payload")},
@@ -140,6 +149,8 @@ export async function wipeFile(query, fileId) {
   }
   await changed(query, SQL.ZERO_FILE, [fileId]);
   removed += await changed(query, SQL.DELETE_FILE, [fileId]);
+  // Legacy single-file seals use the file id as their seal id.
+  await changed(query, SQL.DELETE_BATCH_ATTEMPTS, [fileId]);
   return removed;
 }
 
@@ -149,11 +160,16 @@ export async function wipeFile(query, fileId) {
  * @returns {Promise<number>}
  */
 export async function wipeBatch(query, batchId) {
+  // Take the seal row first, the same order an unlock uses, so the two never
+  // wait on each other's locks in a cycle.
+  await query("select 1 from sealed_batches where id = $1 for update", [batchId]);
   const files = await query("select id from sealed_files where batch_id = $1", [batchId]);
   let removed = 0;
   for (const row of files) {
     removed += await wipeFile(query, String(row.id));
   }
+  await changed(query, SQL.DELETE_BATCH_GRANTS, [batchId]);
+  await changed(query, SQL.DELETE_BATCH_ATTEMPTS, [batchId]);
   await changed(query, SQL.ZERO_BATCH, [batchId]);
   removed += await changed(query, SQL.DELETE_BATCH, [batchId]);
   return removed;
@@ -184,13 +200,15 @@ export async function wipeUpload(query, uploadId) {
 }
 
 const DUE_BATCHES = `
-  select id from sealed_batches
-  where expires_at <= now()
+  select b.id from sealed_batches b
+  where b.expires_at <= now()
      or (
-       download_count >= max_downloads
-       and (grant_expires_at is null or grant_expires_at <= now())
+       b.download_count >= b.max_downloads
+       and not exists (
+         select 1 from batch_grants g where g.batch_id = b.id and g.expires_at > now()
+       )
      )
-  order by expires_at
+  order by b.expires_at
 `;
 
 const DUE_LEGACY = `
@@ -204,7 +222,7 @@ const DUE_LEGACY = `
  * Delete every abandoned upload, expired seal, and used-up seal.
  * A used-up seal stays until its download ticket has ended.
  * @param {Query} query
- * @returns {Promise<{ uploads: number, uploadVacuum: number, sessions: number, batches: number, legacy: number }>}
+ * @returns {Promise<{ uploads: number, sessions: number, batches: number, legacy: number, grants: number }>}
  */
 export async function wipeDue(query) {
   const uploads = await wipeAbandonedUploads(query);
@@ -216,26 +234,29 @@ export async function wipeDue(query) {
   for (const row of legacy) {
     await wipeFile(query, String(row.id));
   }
-  return { uploads: uploads.chunks, uploadVacuum: uploads.vacuum, sessions: uploads.sessions, batches: batches.length, legacy: legacy.length };
+  const grants = await changed(query, SQL.DELETE_EXPIRED_GRANTS);
+  return { uploads: uploads.chunks, sessions: uploads.sessions, batches: batches.length, legacy: legacy.length, grants };
 }
 
 /**
+ * An upload is due when it was finished or cancelled, when it never received a
+ * chunk within 5 minutes, when it went 2 hours without a chunk, or when it is
+ * older than 12 hours however often it was kept alive.
  * @param {Query} query
- * @returns {Promise<{ chunks: number, vacuum: number, sessions: number }>}
+ * @returns {Promise<{ chunks: number, sessions: number }>}
  */
 export async function wipeAbandonedUploads(query) {
   const sessions = await query(
-    `select id, had_chunks from upload_sessions
+    `select id from upload_sessions
      where state <> 'pending'
+        or created_at < now() - interval '12 hours'
         or (had_chunks = false and updated_at < now() - interval '5 minutes')
         or (had_chunks = true and updated_at < now() - interval '2 hours')
      order by updated_at
      for update`,
   );
   let removed = 0;
-  let vacuum = 0;
   for (const row of sessions) {
-    if (row.had_chunks) vacuum += 1;
     removed += await wipeUpload(query, String(row.id));
   }
   const rows = await query(
@@ -253,8 +274,7 @@ export async function wipeAbandonedUploads(query) {
       row.chunk_index,
     ]);
   }
-  if (rows.length > 0) vacuum += 1;
-  return { chunks: removed, vacuum, sessions: sessions.length };
+  return { chunks: removed, sessions: sessions.length };
 }
 
 /**
@@ -307,6 +327,9 @@ export async function wipeEverything(query, onProgress) {
     await changed(query, SQL.ZERO_UPLOAD_SESSION, [row.id]);
     await changed(query, SQL.DELETE_UPLOAD_SESSION, [row.id]);
   }
+
+  await query("delete from batch_grants");
+  await query("delete from unlock_attempts");
 
   return { chunks: chunkCount, files: fileCount, batches: batchCount, uploads: uploadCount };
 }

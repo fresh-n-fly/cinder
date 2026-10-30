@@ -1,9 +1,18 @@
 import { createRootRoute, HeadContent, Outlet, Scripts } from "@tanstack/react-router";
+import { useEffect } from "react";
 import { Toaster } from "sonner";
 import { APP_NAME, APP_TAGLINE } from "@/lib/constants";
 import appCss from "../styles.css?url";
 
 const title = `${APP_NAME} — ${APP_TAGLINE}`;
+
+/** Remove decrypted temp files an earlier visit may have left in this browser. */
+function StorageSweep() {
+  useEffect(() => {
+    void import("@/lib/save-file").then((module) => module.sweepStaleSaves()).catch(() => undefined);
+  }, []);
+  return null;
+}
 const description =
   "Send files that vanish. Lock them with a password, choose when they expire, and they are deleted for good.";
 
@@ -32,6 +41,7 @@ export const Route = createRootRoute({
       </head>
       <body className="antialiased">
         <Outlet />
+        <StorageSweep />
         <Toaster
           theme="dark"
           position="bottom-center"

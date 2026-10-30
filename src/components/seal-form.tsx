@@ -6,14 +6,23 @@ import { FileReceipt, type Receipt } from "@/components/file-receipt";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { CHUNK_PLAIN_BYTES, MIME_PAD_BYTES, MIN_PASSWORD_LENGTH, NAME_PAD_BYTES } from "@/lib/constants";
 import {
+  AAD_VERSION,
+  CHUNK_PLAIN_BYTES,
+  MIME_PAD_BYTES,
+  MIN_PASSWORD_LENGTH,
+  NAME_PAD_BYTES,
+} from "@/lib/constants";
+import {
+  chunkAad,
   createBatchKeys,
   encryptPadded,
   encryptWithKey,
   generatePassphrase,
+  nameAad,
   passwordScore,
   randomHex,
+  typeAad,
   validatePassword,
 } from "@/lib/crypto/vault";
 import {
@@ -86,24 +95,32 @@ export function SealForm() {
       const prepared: {
         file: File;
         fileNonce: string;
+        chunkCount: number;
         nameIv: string;
         nameCt: string;
         mimeIv: string;
         mimeCt: string;
       }[] = [];
-      for (let index = 0; index < files.length; index += 1) {
+      const fileCount = files.length;
+      for (let index = 0; index < fileCount; index += 1) {
         const file = files[index]!;
         const fileNonce = randomHex(16);
-        const nameSealed = await encryptPadded(keys.key, file.name, `${fileNonce}:name`, NAME_PAD_BYTES);
+        const nameSealed = await encryptPadded(
+          keys.key,
+          file.name,
+          nameAad(AAD_VERSION, fileNonce, index, fileCount),
+          NAME_PAD_BYTES,
+        );
         const mimeSealed = await encryptPadded(
           keys.key,
           file.type || "application/octet-stream",
-          `${fileNonce}:type`,
+          typeAad(AAD_VERSION, fileNonce, index, fileCount),
           MIME_PAD_BYTES,
         );
         prepared.push({
           file,
           fileNonce,
+          chunkCount: Math.ceil(file.size / CHUNK_PLAIN_BYTES),
           nameIv: nameSealed.iv,
           nameCt: nameSealed.ciphertextHex,
           mimeIv: mimeSealed.iv,
@@ -128,13 +145,18 @@ export function SealForm() {
         for (let offset = 0; offset < item.file.size; offset += CHUNK_PLAIN_BYTES) {
           const end = Math.min(item.file.size, offset + CHUNK_PLAIN_BYTES);
           const slice = await item.file.slice(offset, end).arrayBuffer();
-          const sealed = await encryptWithKey(keys.key, slice, `${item.fileNonce}:${chunkIndex}`);
+          const sealed = await encryptWithKey(
+            keys.key,
+            slice,
+            chunkAad(AAD_VERSION, item.fileNonce, chunkIndex, item.chunkCount),
+          );
           await putCipherChunk(uploadId, index, chunkIndex, sealed.iv, sealed.ciphertext);
           chunkIndex += 1;
           setProgress(
             `Sealing ${index + 1} of ${prepared.length} · ${formatBytes(end)} of ${formatBytes(item.file.size)}`,
           );
         }
+        if (chunkIndex !== item.chunkCount) throw new Error("A file changed while it was being sealed.");
         packed.push({
           fileIndex: index,
           fileNonce: item.fileNonce,
@@ -149,6 +171,7 @@ export function SealForm() {
       setProgress("Finishing");
       const result = await finishUpload({
         uploadId,
+        format: AAD_VERSION,
         saltAuth: keys.saltAuth,
         saltEnc: keys.saltEnc,
         authHash: keys.authHash,

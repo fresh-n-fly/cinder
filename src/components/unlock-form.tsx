@@ -6,10 +6,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { MIME_PAD_BYTES, NAME_PAD_BYTES } from "@/lib/constants";
 import {
+  chunkAad,
   decryptPadded,
   decryptWithKey,
   deriveBatchKey,
   deriveVerifierHex,
+  nameAad,
+  typeAad,
   unsealFile,
   zeroBytes,
 } from "@/lib/crypto/vault";
@@ -30,6 +33,8 @@ type ServerFile = {
   id: string;
   chunkCount: number;
   legacy: boolean;
+  fileIndex: number;
+  aadVersion: number;
   fileNonce: string;
   nameIv: string;
   nameCt: string;
@@ -47,12 +52,53 @@ type ReadyFile = {
   mime: string;
   chunkCount: number;
   legacy: boolean;
+  aadVersion: number;
+  fileIndex: number;
   fileNonce: string;
   iv: string;
 };
 
+const TAMPERED = "This seal was changed on the server and cannot be opened safely.";
+
 function isAbort(err: unknown): boolean {
   return typeof err === "object" && err !== null && "name" in err && (err as { name: string }).name === "AbortError";
+}
+
+function isIntegrityFailure(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "name" in err && (err as { name: string }).name === "OperationError";
+}
+
+/**
+ * Refuse a batch whose shape could only come from editing the database,
+ * before trying to decrypt anything.
+ *
+ * - Legacy entries predate batches: a legacy seal holds exactly one file, and
+ *   its stored name doubles as associated data. A name shaped like newer
+ *   associated data means pieces of a newer seal were relabelled to dodge
+ *   the bindings below.
+ * - Every other file has a 32-hex nonce; anything else is injected text.
+ * - Format-2 seals bind each file's position and the file count, so positions
+ *   must be exactly 0..n-1.
+ */
+function checkBatchShape(files: ServerFile[]): void {
+  const legacy = files.filter((file) => file.legacy);
+  if (legacy.length > 0) {
+    const name = legacy[0]?.originalName ?? "";
+    if (files.length !== 1 || /^cinder:/i.test(name) || /^[0-9a-f]{32}:/i.test(name)) {
+      throw new Error(TAMPERED);
+    }
+    return;
+  }
+  if (files.some((file) => !/^[0-9a-f]{32}$/.test(file.fileNonce))) throw new Error(TAMPERED);
+  const current = files.filter((file) => file.aadVersion >= 2);
+  if (current.length === 0) return;
+  const count = files.length;
+  const positions = new Set(current.map((file) => file.fileIndex));
+  const valid =
+    current.length === count &&
+    positions.size === count &&
+    [...positions].every((index) => Number.isInteger(index) && index >= 0 && index < count);
+  if (!valid) throw new Error(TAMPERED);
 }
 
 function triggerDownload(data: ArrayBuffer, name: string, mime: string) {
@@ -114,7 +160,17 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
         let written = 0;
         for (let index = 0; index < opened.chunkCount; index += 1) {
           const pulled = await pullCipherChunk(ticket, opened.id, index);
-          const plain = await decryptWithKey(key, pulled.bytes, pulled.iv, `${opened.fileNonce}:${index}`);
+          let plain: ArrayBuffer;
+          try {
+            plain = await decryptWithKey(
+              key,
+              pulled.bytes,
+              pulled.iv,
+              chunkAad(opened.aadVersion, opened.fileNonce, index, opened.chunkCount),
+            );
+          } catch (err) {
+            throw isIntegrityFailure(err) ? new Error(TAMPERED) : err;
+          }
           const bytes = new Uint8Array(plain);
           await sink.write(bytes);
           written += bytes.byteLength;
@@ -159,7 +215,9 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
       if (!payload.ticket || !payload.saltEnc || !payload.files?.length) {
         throw new Error("The server returned an incomplete batch.");
       }
+      checkBatchShape(payload.files);
       const key = await deriveBatchKey(password, payload.saltEnc);
+      const fileCount = payload.files.length;
       const ready: ReadyFile[] = [];
       for (const file of payload.files) {
         if (file.legacy) {
@@ -169,23 +227,46 @@ export function UnlockForm({ id, meta }: { id: string; meta: UnlockMeta }) {
             mime: file.mimeType || "application/octet-stream",
             chunkCount: file.chunkCount,
             legacy: true,
+            aadVersion: 1,
+            fileIndex: -1,
             fileNonce: "",
             iv: file.iv,
           });
           continue;
         }
-        const name = await decryptPadded(key, file.nameCt, file.nameIv, `${file.fileNonce}:name`, NAME_PAD_BYTES);
-        const mime = await decryptPadded(key, file.mimeCt, file.mimeIv, `${file.fileNonce}:type`, MIME_PAD_BYTES);
+        let name: string;
+        let mime: string;
+        try {
+          name = await decryptPadded(
+            key,
+            file.nameCt,
+            file.nameIv,
+            nameAad(file.aadVersion, file.fileNonce, file.fileIndex, fileCount),
+            NAME_PAD_BYTES,
+          );
+          mime = await decryptPadded(
+            key,
+            file.mimeCt,
+            file.mimeIv,
+            typeAad(file.aadVersion, file.fileNonce, file.fileIndex, fileCount),
+            MIME_PAD_BYTES,
+          );
+        } catch (err) {
+          throw isIntegrityFailure(err) && file.aadVersion >= 2 ? new Error(TAMPERED) : err;
+        }
         ready.push({
           id: file.id,
           name: name || "download",
           mime: mime || "application/octet-stream",
           chunkCount: file.chunkCount,
           legacy: false,
+          aadVersion: file.aadVersion,
+          fileIndex: file.fileIndex,
           fileNonce: file.fileNonce,
           iv: "",
         });
       }
+      ready.sort((a, b) => a.fileIndex - b.fileIndex);
       const remainingAfter = payload.remainingAfter ?? 0;
       setRemaining(remainingAfter);
       setSession({
