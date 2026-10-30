@@ -269,21 +269,28 @@ env_get() {
   printf '%s' "${line#"${key}"=}"
 }
 
+assert_safe_env_path() {
+  local file=$1
+  [[ ! -L "$file" ]] || die "Refusing to use symlinked environment file: ${file}"
+  [[ ! -e "$file" || -f "$file" ]] || die "Environment path is not a regular file: ${file}"
+}
+
 upsert_env() {
   local file=$1 key=$2 value=$3 tmp
-  touch "$file"
-  tmp=$(mktemp)
-  if grep -q "^${key}=" "$file"; then
+  assert_safe_env_path "$file"
+  tmp=$(mktemp /etc/cinder/.env.XXXXXX)
+  if [[ -f "$file" ]] && grep -q "^${key}=" "$file"; then
     awk -v k="$key" -v v="$value" '$0 ~ "^" k "=" { print k "=" v; next } { print }' "$file" > "$tmp"
   else
-    cat "$file" > "$tmp"
+    [[ ! -f "$file" ]] || cat "$file" > "$tmp"
     printf '%s=%s\n' "$key" "$value" >> "$tmp"
   fi
-  cat "$tmp" > "$file"
-  rm -f "$tmp"
+  chmod 600 "$tmp"
+  mv -Tf "$tmp" "$file"
 }
 
 install -d -m 755 /etc/cinder
+assert_safe_env_path "$PREFIX/.env"
 db_url=$(env_get DATABASE_URL "$PREFIX/.env")
 case "$db_url" in
   *change-me*|*choose-a-long-password*|"")
@@ -331,7 +338,8 @@ SQL
 
 umask 077
 if [[ ! -f "$PREFIX/.env" ]]; then
-  cat > "$PREFIX/.env" << EOF
+  env_tmp=$(mktemp /etc/cinder/.env.XXXXXX)
+  cat > "$env_tmp" << EOF
 NODE_ENV=production
 HOST=127.0.0.1
 PORT=3000
@@ -339,6 +347,8 @@ NITRO_HOST=127.0.0.1
 NITRO_PORT=3000
 DATABASE_URL=${db_url}
 EOF
+  chmod 600 "$env_tmp"
+  mv -Tf "$env_tmp" "$PREFIX/.env"
 fi
 umask 022
 upsert_env "$PREFIX/.env" NODE_ENV production
@@ -440,7 +450,9 @@ if ! grep -q '\[migrate\]' "$build_log"; then
   die "The build log has no migration result. See ${build_log}."
 fi
 [[ -f "$PREFIX/.output/server/index.mjs" ]] || die "The build did not produce .output/server/index.mjs."
-chown -R cinder:cinder "$PREFIX"
+chown -R root:root "$PREFIX"
+chown cinder:cinder "$PREFIX/.env"
+chmod 600 "$PREFIX/.env"
 
 say "Installing the systemd service."
 sed \
@@ -710,7 +722,7 @@ ${listen80_6}
     }
 
     location / {
-        return 301 https://\$host\$request_uri;
+        return 301 https://\$server_name\$request_uri;
     }
 }
 
@@ -748,24 +760,12 @@ server {
 ${listen80_6}
     server_name ${server_names};
 
-    client_max_body_size 8m;
-    access_log /var/log/nginx/cinder.access.log combined;
-    error_log  /var/log/nginx/cinder.error.log;
-
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
     }
 
     location / {
-        proxy_pass http://cinder;
-        proxy_http_version 1.1;
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Connection        "";
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        return 301 https://\$server_name\$request_uri;
     }
 }
 
@@ -879,7 +879,7 @@ page_ok() {
   return 1
 }
 
-page_ok "http://127.0.0.1/" || die "Nginx is up, but http://127.0.0.1/ is not the Cinder page."
+page_ok "http://127.0.0.1/" || die "Nginx is up, but HTTP did not redirect to the Cinder page."
 page_ok "https://127.0.0.1/" || die "HTTPS on port 443 is not serving Cinder."
 
 le_cert=""
@@ -897,7 +897,7 @@ if [[ -n "$DOMAIN" && -n "$EMAIL" && ! -f "$le_cert" ]]; then
     --domain "$DOMAIN" --keep-until-expiring; then
     say "Let's Encrypt issued a certificate."
   else
-    say "Let's Encrypt did not issue a certificate. Keeping HTTP and the self-signed HTTPS certificate."
+    say "Let's Encrypt did not issue a certificate. Keeping the self-signed HTTPS certificate and HTTP redirect."
     say "A private address cannot get a public certificate. A public name has to point here, and port 80 has to be reachable from the internet."
   fi
 fi
@@ -968,11 +968,9 @@ done
 say ""
 say "Cinder is up."
 if [[ ${#ips[@]} -eq 0 ]]; then
-  say "  http://127.0.0.1/"
   say "  https://127.0.0.1/   ${tls_note}"
 else
   for ip in "${ips[@]}"; do
-    say "  http://${ip}/"
     say "  https://${ip}/   ${tls_note}"
   done
 fi

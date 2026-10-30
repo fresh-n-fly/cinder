@@ -16,7 +16,7 @@ Cinder locks the files in the browser and keeps the server from learning the pas
 
 **The link is unguessable, and use is limited.** A seal address is 32 random hex characters. The sender chooses an expiry, from 15 minutes up to 30 days, and a download count from 1 to 100. Twelve wrong passwords lock the seal until that expiry. When the expiry passes, or the downloads are used up and the 15-minute ticket has ended, a job running about once a minute overwrites the secret columns, deletes the rows, and rewrites those table files. The same wipe is available by hand with `deploy/purge.sh --yes`.
 
-**The host is kept small.** The installer puts PostgreSQL and the Node app on `127.0.0.1` only. Nginx is the service on ports 80 and 443, with HTTPS from an existing Let’s Encrypt certificate or a self-signed certificate. The database password is a new 48-character random value, written to `/opt/cinder/.env` mode `600`, and the install script does not print it. Download tickets are sent in the request body, and those responses are marked not to be cached.
+**The host is kept small.** The installer puts PostgreSQL and the Node app on `127.0.0.1` only. Nginx is the service on ports 80 and 443; port 80 redirects to HTTPS, using an existing Let’s Encrypt certificate or a self-signed certificate. The database password is a new 48-character random value, written to `/opt/cinder/.env` mode `600`, and the install script does not print it. Download tickets are sent in the request body, and those responses are marked not to be cached.
 
 **What a database copy still shows.** Expiry, download counts, salts, the proof hash, the per-piece initialization vectors, and the byte length of each locked piece. That length is close to the original file size. A backup, the write-ahead log, and freed disk blocks can still hold ciphertext after a row is gone. Full-disk encryption is what covers those leftover blocks.
 
@@ -80,7 +80,7 @@ cd cinder
 sudo bash deploy/install.sh
 ```
 
-The script installs Node.js 22, PostgreSQL, and Nginx, builds the app, and serves it on ports 80 and 443. Node listens only on `127.0.0.1:3000`. That port is the application. PostgreSQL listens only on `127.0.0.1:5432`.
+The script installs Node.js 22, PostgreSQL, and Nginx, builds the app, and serves it on HTTPS port 443 while port 80 redirects to HTTPS. Node listens only on `127.0.0.1:3000`. That port is the application. PostgreSQL listens only on `127.0.0.1:5432`.
 
 Run the same command again to update Cinder. The database and `/opt/cinder/.env` are kept. The script does not print the database password.
 
@@ -90,7 +90,7 @@ When a DNS name already points at this server and port 80 is reachable from the 
 sudo bash deploy/install.sh --domain files.example.com --email you@example.com
 ```
 
-Let’s Encrypt is tried once. If it cannot issue a certificate, the site still answers on HTTP and on HTTPS with a self-signed certificate. Browsers warn about that certificate until it is trusted. A private IP address cannot get a public certificate.
+Let’s Encrypt is tried once. If it cannot issue a certificate, HTTP still redirects to HTTPS with a self-signed certificate. Browsers warn about that certificate until it is trusted. A private IP address cannot get a public certificate.
 
 If `/etc/letsencrypt/live/` already contains a certificate, the installer uses that certificate and the domain name of its directory. `--domain` is not required in that case. When more than one certificate is there, pass `--domain` to choose it. A domain saved from an earlier run is kept when its certificate is still present.
 
