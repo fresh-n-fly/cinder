@@ -231,6 +231,28 @@ export function zeroBytes(bytes: Uint8Array): void {
   bytes.fill(0);
 }
 
+/*
+ * AES-GCM associated data.
+ *
+ * Format 1 bound each chunk only to its file and position, so whoever controls
+ * the database could lower a file's chunk count or drop a file from a batch
+ * and every remaining piece would still decrypt. Format 2 also binds each
+ * chunk to its file's chunk count, and each name and type to the file's
+ * position and the number of files in the batch. Any of those edits then
+ * makes decryption fail instead of producing a shorter file or batch.
+ */
+export function chunkAad(version: number, fileNonce: string, index: number, chunkCount: number): string {
+  return version >= 2 ? `cinder:v2:chunk:${fileNonce}:${index}:${chunkCount}` : `${fileNonce}:${index}`;
+}
+
+export function nameAad(version: number, fileNonce: string, fileIndex: number, fileCount: number): string {
+  return version >= 2 ? `cinder:v2:name:${fileNonce}:${fileIndex}:${fileCount}` : `${fileNonce}:name`;
+}
+
+export function typeAad(version: number, fileNonce: string, fileIndex: number, fileCount: number): string {
+  return version >= 2 ? `cinder:v2:type:${fileNonce}:${fileIndex}:${fileCount}` : `${fileNonce}:type`;
+}
+
 export function generatePassphrase(): string {
   const letters = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
   const digits = "23456789";

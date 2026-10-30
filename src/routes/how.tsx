@@ -15,7 +15,7 @@ const SECTIONS = [
   },
   {
     title: "How the lock works",
-    body: "Your password becomes a key on your computer. That key locks each piece of a file, and it locks the name and the type as well. Names are padded to a fixed size so the locked copy does not reveal how long they were. We use AES-256, a strong, widely used standard. Each piece is bound to its place in the file, so a piece cannot be swapped in unnoticed.",
+    body: "Your password becomes a key on your computer. That key locks each piece of a file, and it locks the name and the type as well. Names are padded to a fixed size so the locked copy does not reveal how long they were. We use AES-256, a strong, widely used standard. Each piece is bound to its place in the file and to the file's length, and each file to its place in the seal, so a piece cannot be swapped, dropped, or cut off unnoticed.",
   },
   {
     title: "Checking the password",
@@ -23,11 +23,11 @@ const SECTIONS = [
   },
   {
     title: "When files are deleted",
-    body: "The files are permanently deleted when the expiry date and time pass, when they have been downloaded the number of times you allowed, or when the password is typed incorrectly too many times. There is no recycle bin. No one at Cinder can restore deleted files.",
+    body: "The files are permanently deleted when the expiry date and time pass, or when they have been downloaded the number of times you allowed. Too many wrong passwords from one connection block that connection; many wrong passwords in total lock the files until they expire. There is no recycle bin. No one at Cinder can restore deleted files.",
   },
   {
     title: "What you can send",
-    body: "Any file type, and any size per file. One seal can hold up to 100 files. Everything stored on the server at once — every seal, combined — stays within 20 GB.",
+    body: "Any file type. One seal can hold up to 100 files and 5 GB in total. Everything stored on the server at once — every seal, combined — stays within 20 GB.",
   },
   {
     title: "What Cinder is not",

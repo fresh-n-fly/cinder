@@ -130,14 +130,19 @@ SQL
 
 say "Overdue seals"
 psql_cmd << 'SQL'
-SELECT id, expires_at, download_count, max_downloads, grant_expires_at
-FROM sealed_batches
-WHERE expires_at <= now()
+SELECT b.id, b.expires_at, b.download_count, b.max_downloads
+FROM sealed_batches b
+WHERE b.expires_at <= now()
    OR (
-     download_count >= max_downloads
-     AND (grant_expires_at IS NULL OR grant_expires_at <= now())
+     b.download_count >= b.max_downloads
+     AND NOT EXISTS (SELECT 1 FROM batch_grants g WHERE g.batch_id = b.id AND g.expires_at > now())
    )
-ORDER BY expires_at;
+ORDER BY b.expires_at;
+SQL
+
+say "Expired download tickets"
+psql_cmd << 'SQL'
+SELECT count(*) AS expired_tickets FROM batch_grants WHERE expires_at <= now();
 SQL
 
 say "Overdue legacy files"
@@ -155,7 +160,7 @@ SELECT count(*) AS abandoned_uploads
 FROM upload_chunks c
 LEFT JOIN upload_sessions s ON s.id = c.upload_id
 WHERE (s.id IS NULL AND c.created_at < now() - interval '2 hours')
-   OR (s.id IS NOT NULL AND (s.state <> 'pending' OR s.updated_at < now() - interval '2 hours'));
+   OR (s.id IS NOT NULL AND (s.state <> 'pending' OR s.created_at < now() - interval '12 hours' OR s.updated_at < now() - interval '2 hours'));
 SQL
 
 say "Abandoned upload sessions older than 2 hours"
@@ -163,6 +168,7 @@ psql_cmd << 'SQL'
 SELECT count(*) AS abandoned_upload_sessions
 FROM upload_sessions
 WHERE state <> 'pending'
+   OR created_at < now() - interval '12 hours'
    OR (had_chunks = false AND updated_at < now() - interval '5 minutes')
    OR (had_chunks = true AND updated_at < now() - interval '2 hours');
 SQL
@@ -176,21 +182,23 @@ SQL
 
 due=$(psql_cmd -tA << 'SQL'
 SELECT
-  (SELECT count(*) FROM sealed_batches
-    WHERE expires_at <= now()
+  (SELECT count(*) FROM sealed_batches b
+    WHERE b.expires_at <= now()
        OR (
-         download_count >= max_downloads
-         AND (grant_expires_at IS NULL OR grant_expires_at <= now())
+         b.download_count >= b.max_downloads
+         AND NOT EXISTS (SELECT 1 FROM batch_grants g WHERE g.batch_id = b.id AND g.expires_at > now())
        ))
+  + (SELECT count(*) FROM batch_grants WHERE expires_at <= now())
   + (SELECT count(*) FROM sealed_files
       WHERE batch_id IS NULL
         AND (expires_at <= now() OR download_count >= max_downloads))
   + (SELECT count(*) FROM upload_chunks c
       LEFT JOIN upload_sessions s ON s.id = c.upload_id
       WHERE (s.id IS NULL AND c.created_at < now() - interval '2 hours')
-         OR (s.id IS NOT NULL AND (s.state <> 'pending' OR s.updated_at < now() - interval '2 hours')))
+         OR (s.id IS NOT NULL AND (s.state <> 'pending' OR s.created_at < now() - interval '12 hours' OR s.updated_at < now() - interval '2 hours')))
   + (SELECT count(*) FROM upload_sessions
       WHERE state <> 'pending'
+         OR created_at < now() - interval '12 hours'
          OR (had_chunks = false AND updated_at < now() - interval '5 minutes')
          OR (had_chunks = true AND updated_at < now() - interval '2 hours'))
   + (SELECT count(*) FROM sealed_file_chunks c
