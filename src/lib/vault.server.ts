@@ -4,17 +4,23 @@ import {
   GCM_TAG_BYTES,
   GRANT_TTL_MS,
   MAX_BATCH_FILES,
+  MAX_ACTIVE_UPLOADS,
+  MAX_ACTIVE_UPLOADS_PER_IP,
   MAX_CHUNKS_PER_FILE,
   MAX_CHUNKS_TOTAL,
   MAX_CHUNK_BYTES,
   MAX_DOWNLOADS,
   MAX_FAILED_ATTEMPTS,
+  MAX_PENDING_CHUNKS,
+  MAX_PENDING_CHUNKS_PER_IP,
+  MAX_STORED_CHUNKS,
   MAX_STORE_BYTES,
   MAX_TTL_MS,
   MIME_PAD_BYTES,
   MIN_DOWNLOADS,
   MIN_TTL_MS,
   NAME_PAD_BYTES,
+  UPLOAD_TTL_MS,
 } from "@/lib/constants";
 import { chunkCountFor } from "@/lib/files";
 import { dbSource, getSql, type Sql } from "@/lib/db";
@@ -65,6 +71,13 @@ type FileRow = {
   name_ct: string | null;
   mime_iv: string | null;
   mime_ct: string | null;
+};
+
+type UploadSessionRow = {
+  id: string;
+  client_ip: string | null;
+  state: string;
+  updated_at: string;
 };
 
 const ROOM_ERROR =
@@ -132,6 +145,17 @@ async function storedBytes(sql: Sql): Promise<number> {
   return asNumber(rows[0]?.total);
 }
 
+async function storedChunkCount(sql: Sql): Promise<number> {
+  const rows = await sql<{ total: number }>`
+    select (
+      coalesce((select count(*) from sealed_file_chunks), 0)
+      + coalesce((select count(*) from upload_chunks), 0)
+      + coalesce((select count(*) from sealed_files where coalesce(cipher_bytes, 0) > 0), 0)
+    )::float8 as total
+  `;
+  return asNumber(rows[0]?.total);
+}
+
 type Query = (text: string, params?: unknown[]) => Promise<Record<string, unknown>[]>;
 
 function asQuery(sql: Sql): Query {
@@ -192,9 +216,14 @@ async function vacuumTables(sql: Sql, tables: readonly string[]): Promise<void> 
 
 export async function purgeExpired(): Promise<void> {
   const sql = await getSql();
-  const due = await wipeDue(asQuery(sql));
+  const due = await sql.transaction(async (lockedSql) => {
+    if (dbSource !== "pglite") {
+      await lockedSql.query("lock table upload_chunks in share row exclusive mode");
+    }
+    return wipeDue(asQuery(lockedSql));
+  });
   const tables: string[] = [];
-  if (due.uploads > 0) tables.push("upload_chunks");
+  if (due.uploads > 0 || due.sessions > 0) tables.push("upload_chunks", "upload_sessions");
   if (due.batches > 0 || due.legacy > 0) {
     tables.push("sealed_file_chunks", "sealed_files", "sealed_batches");
   }
@@ -271,19 +300,52 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
   };
 }
 
-export function startUploadSession(): { uploadId: string } {
-  return { uploadId: randomBytes(16).toString("hex") };
+export async function startUploadSession(clientIp: string | null): Promise<{ uploadId: string }> {
+  const uploadId = randomBytes(16).toString("hex");
+  const sql = await getSql();
+  await withUploadQuotaLock(sql, async (lockedSql) => {
+    const activeTotal = await lockedSql<{ n: number }>`
+      select count(*)::float8 as n from upload_sessions
+      where state = 'pending'
+    `;
+    if (asNumber(activeTotal[0]?.n) >= MAX_ACTIVE_UPLOADS) {
+      throw new Error("Too many uploads are in progress.");
+    }
+    if (clientIp) {
+      const active = await lockedSql<{ n: number }>`
+        select count(*)::float8 as n from upload_sessions
+        where client_ip = ${clientIp} and state = 'pending'
+      `;
+      if (asNumber(active[0]?.n) >= MAX_ACTIVE_UPLOADS_PER_IP) {
+        throw new Error("Too many uploads are in progress from this address.");
+      }
+    }
+    await lockedSql`
+      insert into upload_sessions (id, client_ip)
+      values (${uploadId}, ${clientIp})
+    `;
+  });
+  return { uploadId };
 }
 
-async function discardUpload(uploadId: string): Promise<void> {
-  const sql = await getSql();
+async function markUploadForCleanup(sql: Sql, uploadId: string, state: "finished" | "cancelled"): Promise<void> {
   // Leave wiping and table rewrites to the expiry worker instead of doing
   // row-by-row secret deletion in a public request handler.
+  await sql`
+    update upload_sessions
+    set state = ${state}, updated_at = now() - interval '3 hours'
+    where id = ${uploadId}
+  `;
   await sql`
     update upload_chunks
     set created_at = now() - interval '3 hours'
     where upload_id = ${uploadId}
   `;
+}
+
+async function discardUpload(uploadId: string): Promise<void> {
+  const sql = await getSql();
+  await withUploadQuotaLock(sql, (lockedSql) => markUploadForCleanup(lockedSql, uploadId, "cancelled"));
 }
 
 export async function cancelUpload(uploadId: string): Promise<void> {
@@ -321,6 +383,17 @@ export async function storeChunk(input: {
   let discard = false;
   try {
     await withUploadQuotaLock(sql, async (lockedSql) => {
+      const sessions = await lockedSql<UploadSessionRow>`
+        select id, client_ip, state, updated_at::text as updated_at from upload_sessions
+        where id = ${input.uploadId}
+        for update
+      `;
+      const session = sessions[0];
+      if (!session || session.state !== "pending") throw new Error("Invalid upload.");
+      if (new Date(toIso(session.updated_at)).getTime() <= Date.now() - UPLOAD_TTL_MS) {
+        discard = true;
+        throw new Error("Upload expired.");
+      }
       const existing = await lockedSql<{ n: number }>`
         select count(*)::float8 as n from upload_chunks
         where upload_id = ${input.uploadId}
@@ -330,6 +403,35 @@ export async function storeChunk(input: {
         discard = true;
         throw new Error("Invalid chunk.");
       }
+      const current = await lockedSql<{ n: number }>`
+        select count(*)::float8 as n from upload_chunks
+        where upload_id = ${input.uploadId}
+          and file_index = ${input.fileIndex} and chunk_index = ${input.chunkIndex}
+      `;
+      if (asNumber(current[0]?.n) !== 0) throw new Error("Chunk already uploaded.");
+      const pending = await lockedSql<{ n: number }>`
+        select count(*)::float8 as n from upload_chunks
+      `;
+      if (asNumber(pending[0]?.n) >= MAX_PENDING_CHUNKS) {
+        discard = true;
+        throw new Error("Too many uploads are in progress.");
+      }
+      if ((await storedChunkCount(lockedSql)) >= MAX_STORED_CHUNKS) {
+        discard = true;
+        throw new Error("Too many files are stored right now.");
+      }
+      if (session.client_ip) {
+        const pendingForIp = await lockedSql<{ n: number }>`
+          select count(*)::float8 as n
+          from upload_chunks c
+          join upload_sessions s on s.id = c.upload_id
+          where s.client_ip = ${session.client_ip} and s.state = 'pending'
+        `;
+        if (asNumber(pendingForIp[0]?.n) >= MAX_PENDING_CHUNKS_PER_IP) {
+          discard = true;
+          throw new Error("Too many uploads are in progress from this address.");
+        }
+      }
       const used = await storedBytes(lockedSql);
       if (used + input.payload.length > MAX_STORE_BYTES) {
         discard = true;
@@ -338,8 +440,10 @@ export async function storeChunk(input: {
       await lockedSql`
         insert into upload_chunks (upload_id, file_index, chunk_index, payload, iv, payload_bin)
         values (${input.uploadId}, ${input.fileIndex}, ${input.chunkIndex}, '', ${input.iv}, ${input.payload})
-        on conflict (upload_id, file_index, chunk_index)
-        do update set payload = '', iv = excluded.iv, payload_bin = excluded.payload_bin
+      `;
+      await lockedSql`
+        update upload_sessions set updated_at = now()
+        where id = ${input.uploadId}
       `;
     });
   } catch (err) {
@@ -422,76 +526,89 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
   const error = validateFinishInput(input);
   if (error) throw new Error(error);
   const sql = await getSql();
-
-  let uploadBytes = 0;
+  let discard = false;
   try {
-    for (const file of input.files) {
-      const chunks = await sql<{ chunk_index: number; len: number; iv: string }>`
-        select chunk_index, octet_length(payload_bin)::float8 as len, iv
-        from upload_chunks
-        where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
-        order by chunk_index
+    return await withUploadQuotaLock(sql, async (lockedSql) => {
+      const sessions = await lockedSql<UploadSessionRow>`
+        select id, client_ip, state, updated_at::text as updated_at from upload_sessions
+        where id = ${input.uploadId}
+        for update
       `;
-      if (chunks.length !== file.chunkCount) throw new Error("Upload was incomplete.");
-      for (let index = 0; index < file.chunkCount; index += 1) {
-        const chunk = chunks[index];
-        if (!chunk || chunk.chunk_index !== index || !isHex(chunk.iv, 24)) {
-          throw new Error("Upload was incomplete.");
-        }
-        const len = asNumber(chunk.len);
-        if (len <= 0 || len > MAX_CHUNK_BYTES) throw new Error("Encrypted payload is invalid.");
-        uploadBytes += len;
-        if (uploadBytes > MAX_STORE_BYTES) throw new Error(ROOM_ERROR);
+      const session = sessions[0];
+      if (!session || session.state !== "pending") throw new Error("Invalid upload.");
+      if (new Date(toIso(session.updated_at)).getTime() <= Date.now() - UPLOAD_TTL_MS) {
+        discard = true;
+        throw new Error("Upload expired.");
       }
-    }
-    if (await storedBytes(sql) > MAX_STORE_BYTES) throw new Error(ROOM_ERROR);
-  } catch (err) {
-    await discardUpload(input.uploadId);
-    throw err;
-  }
+      discard = true;
 
-  const batchId = randomBytes(16).toString("hex");
-  const expires = new Date(input.expiresAt).toISOString();
-  try {
-    await sql`
-      insert into sealed_batches (
-        id, salt_auth, auth_hash, salt_enc, expires_at, max_downloads
-      ) values (
-        ${batchId}, ${input.saltAuth}, ${input.authHash}, ${input.saltEnc},
-        ${expires}::timestamptz, ${input.maxDownloads}
-      )
-    `;
+      let uploadBytes = 0;
+      for (const file of input.files) {
+        const chunks = await lockedSql<{ chunk_index: number; len: number; iv: string }>`
+          select chunk_index, octet_length(payload_bin)::float8 as len, iv
+          from upload_chunks
+          where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
+          order by chunk_index
+        `;
+        if (chunks.length !== file.chunkCount) throw new Error("Upload was incomplete.");
+        for (let index = 0; index < file.chunkCount; index += 1) {
+          const chunk = chunks[index];
+          if (!chunk || chunk.chunk_index !== index || !isHex(chunk.iv, 24)) {
+            throw new Error("Upload was incomplete.");
+          }
+          const len = asNumber(chunk.len);
+          if (len <= 0 || len > MAX_CHUNK_BYTES) throw new Error("Encrypted payload is invalid.");
+          uploadBytes += len;
+          if (uploadBytes > MAX_STORE_BYTES) throw new Error(ROOM_ERROR);
+        }
+      }
+      if ((await storedBytes(lockedSql)) > MAX_STORE_BYTES) throw new Error(ROOM_ERROR);
+      if ((await storedChunkCount(lockedSql)) > MAX_STORED_CHUNKS) {
+        throw new Error("Too many files are stored right now.");
+      }
 
-    for (const file of input.files) {
-      const fileId = randomBytes(16).toString("hex");
-      await sql`
-        insert into sealed_files (
-          id, batch_id, original_name, mime_type, size_bytes, ciphertext,
-          salt_enc, iv, salt_auth, auth_hash, expires_at, max_downloads, cipher_bytes,
-          file_nonce, name_iv, name_ct, mime_iv, mime_ct, chunk_count
+      const batchId = randomBytes(16).toString("hex");
+      const expires = new Date(input.expiresAt).toISOString();
+      await lockedSql`
+        insert into sealed_batches (
+          id, salt_auth, auth_hash, salt_enc, expires_at, max_downloads
         ) values (
-          ${fileId}, ${batchId}, null, null, null, null,
-          ${input.saltEnc}, null, ${input.saltAuth}, ${input.authHash},
-          ${expires}::timestamptz, ${input.maxDownloads}, 0,
-          ${file.fileNonce}, ${file.nameIv}, ${file.nameCt}, ${file.mimeIv}, ${file.mimeCt},
-          ${file.chunkCount}
+          ${batchId}, ${input.saltAuth}, ${input.authHash}, ${input.saltEnc},
+          ${expires}::timestamptz, ${input.maxDownloads}
         )
       `;
-      await sql`
-        insert into sealed_file_chunks (file_id, chunk_index, iv, payload)
-        select ${fileId}, chunk_index, iv, payload_bin
-        from upload_chunks
-        where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
-      `;
-    }
 
-    await discardUpload(input.uploadId);
+      for (const file of input.files) {
+        const fileId = randomBytes(16).toString("hex");
+        await lockedSql`
+          insert into sealed_files (
+            id, batch_id, original_name, mime_type, size_bytes, ciphertext,
+            salt_enc, iv, salt_auth, auth_hash, expires_at, max_downloads, cipher_bytes,
+            file_nonce, name_iv, name_ct, mime_iv, mime_ct, chunk_count
+          ) values (
+            ${fileId}, ${batchId}, null, null, null, null,
+            ${input.saltEnc}, null, ${input.saltAuth}, ${input.authHash},
+            ${expires}::timestamptz, ${input.maxDownloads}, 0,
+            ${file.fileNonce}, ${file.nameIv}, ${file.nameCt}, ${file.mimeIv}, ${file.mimeCt},
+            ${file.chunkCount}
+          )
+        `;
+        await lockedSql`
+          insert into sealed_file_chunks (file_id, chunk_index, iv, payload)
+          select ${fileId}, chunk_index, iv, payload_bin
+          from upload_chunks
+          where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
+        `;
+      }
+
+      await markUploadForCleanup(lockedSql, input.uploadId, "finished");
+      discard = false;
+      return { id: batchId };
+    });
   } catch (err) {
-    await destroyBatch(batchId);
-    await discardUpload(input.uploadId);
+    if (discard) await discardUpload(input.uploadId);
     throw err;
   }
-  return { id: batchId };
 }
 
 function verifierMatches(verifierHex: string, authHash: string): boolean {

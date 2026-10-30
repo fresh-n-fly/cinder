@@ -98,7 +98,7 @@ If `/etc/letsencrypt/live/` already contains a certificate, the installer uses t
 
 The installer does not open port 3000. If UFW is already on, it allows OpenSSH and Nginx. If UFW is off, it leaves the firewall alone. It does not delete an existing database.
 
-The generated Nginx site rate-limits only JSON unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance. Multipart chunk downloads are not counted by that limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes.
+The generated Nginx site rate-limits only JSON unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance. Multipart chunk downloads are not counted by that limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
 
 To see or clear those bans:
 

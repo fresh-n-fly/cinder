@@ -723,6 +723,7 @@ write_nginx() {
     printf '%s\n' "    ~*^application/json \$binary_remote_addr;"
     printf '%s\n' "}"
     printf '%s\n' "limit_req_zone \$cinder_unlock_key zone=cinder_unlock:10m rate=10r/m;"
+    printf '%s\n' "limit_req_zone \$binary_remote_addr zone=cinder_seal:10m rate=20r/s;"
     printf '%s\n' "upstream cinder {"
     printf '%s\n' "    server 127.0.0.1:3000;"
     printf '%s\n' "    keepalive 16;"
@@ -762,12 +763,36 @@ ${http2_line}
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
 ${le_ssl}
 
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+
     client_max_body_size 8m;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
 
     location = /api/open {
         limit_req zone=cinder_unlock burst=5 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://cinder;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection        "";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location = /api/seal {
+        limit_req zone=cinder_seal burst=40 nodelay;
         limit_req_status 429;
 
         proxy_pass http://cinder;
@@ -823,12 +848,36 @@ ${http2_line}
     ssl_session_timeout 1d;
     ssl_session_cache shared:SSL:10m;
 
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+
     client_max_body_size 8m;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
 
     location = /api/open {
         limit_req zone=cinder_unlock burst=5 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://cinder;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection        "";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location = /api/seal {
+        limit_req zone=cinder_seal burst=40 nodelay;
         limit_req_status 429;
 
         proxy_pass http://cinder;

@@ -10,6 +10,10 @@ function asInt(value: unknown): number {
   return Number.isFinite(n) ? n : NaN;
 }
 
+function isJsonContentType(value: string): boolean {
+  return /^application\/json(?:\s*;|$)/i.test(value.trim());
+}
+
 function clientIp(request: Request): string | null {
   const raw =
     request.headers.get("x-real-ip")?.trim() ||
@@ -24,7 +28,7 @@ export const Route = createFileRoute("/api/open")({
       POST: async ({ request }) => {
         const contentType = request.headers.get("content-type") || "";
         try {
-          if (contentType.includes("application/json")) {
+          if (isJsonContentType(contentType)) {
             const body = (await request.json()) as Record<string, unknown>;
             if (body.intent !== "unlock") {
               return Response.json({ error: "Unknown action." }, { status: 400 });

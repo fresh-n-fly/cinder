@@ -17,16 +17,28 @@ function asInt(value: unknown): number {
   return Number.isFinite(n) ? n : NaN;
 }
 
+function isJsonContentType(value: string): boolean {
+  return /^application\/json(?:\s*;|$)/i.test(value.trim());
+}
+
+function clientIp(request: Request): string | null {
+  const raw =
+    request.headers.get("x-real-ip")?.trim() ||
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  if (!raw || raw.length > 45 || !/^[0-9a-fA-F:.]+$/.test(raw)) return null;
+  return raw;
+}
+
 export const Route = createFileRoute("/api/seal")({
   server: {
     handlers: {
       POST: async ({ request }) => {
         const contentType = request.headers.get("content-type") || "";
         try {
-          if (contentType.includes("application/json")) {
+          if (isJsonContentType(contentType)) {
             const body = (await request.json()) as Record<string, unknown>;
             if (body.intent === "start") {
-              return Response.json(startUploadSession(), {
+              return Response.json(await startUploadSession(clientIp(request)), {
                 headers: { "Cache-Control": "no-store" },
               });
             }
