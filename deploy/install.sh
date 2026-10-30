@@ -723,6 +723,7 @@ write_nginx() {
     printf '%s\n' "    ~*^application/json \$binary_remote_addr;"
     printf '%s\n' "}"
     printf '%s\n' "limit_req_zone \$cinder_unlock_key zone=cinder_unlock:10m rate=10r/m;"
+    printf '%s\n' "limit_req_zone \$binary_remote_addr zone=cinder_open:10m rate=100r/s;"
     printf '%s\n' "limit_req_zone \$binary_remote_addr zone=cinder_seal:10m rate=20r/s;"
     printf '%s\n' "upstream cinder {"
     printf '%s\n' "    server 127.0.0.1:3000;"
@@ -776,7 +777,8 @@ ${le_ssl}
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
 
-    location = /api/open {
+    location ~* ^/api/open/?$ {
+        limit_req zone=cinder_open burst=200 nodelay;
         limit_req zone=cinder_unlock burst=5 nodelay;
         limit_req_status 429;
 
@@ -791,7 +793,7 @@ ${le_ssl}
         proxy_send_timeout 300s;
     }
 
-    location = /api/seal {
+    location ~* ^/api/seal/?$ {
         limit_req zone=cinder_seal burst=40 nodelay;
         limit_req_status 429;
 
@@ -861,7 +863,8 @@ ${http2_line}
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
 
-    location = /api/open {
+    location ~* ^/api/open/?$ {
+        limit_req zone=cinder_open burst=200 nodelay;
         limit_req zone=cinder_unlock burst=5 nodelay;
         limit_req_status 429;
 
@@ -876,7 +879,7 @@ ${http2_line}
         proxy_send_timeout 300s;
     }
 
-    location = /api/seal {
+    location ~* ^/api/seal/?$ {
         limit_req zone=cinder_seal burst=40 nodelay;
         limit_req_status 429;
 

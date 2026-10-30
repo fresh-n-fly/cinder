@@ -2,10 +2,18 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   CHUNK_BYTES,
   EMPTY_UPLOAD_TTL_MS,
+  ESTIMATED_BATCH_ROW_OVERHEAD_BYTES,
+  ESTIMATED_CHUNK_ROW_OVERHEAD_BYTES,
+  ESTIMATED_FILE_ROW_OVERHEAD_BYTES,
+  ESTIMATED_SESSION_ROW_OVERHEAD_BYTES,
   GCM_TAG_BYTES,
   GRANT_TTL_MS,
+  MAX_BATCH_BYTES,
   MAX_BATCH_FILES,
   MAX_ACTIVE_UPLOADS_PER_IP,
+  MAX_CLIENT_STORED_BATCHES,
+  MAX_CLIENT_STORED_CHUNKS,
+  MAX_CLIENT_LOGICAL_BYTES,
   MAX_EMPTY_UPLOADS,
   MAX_CHUNKS_PER_FILE,
   MAX_CHUNKS_TOTAL,
@@ -14,7 +22,6 @@ import {
   MAX_FAILED_ATTEMPTS,
   MAX_PENDING_CHUNKS,
   MAX_PENDING_CHUNKS_PER_IP,
-  MAX_STORED_CHUNKS,
   MAX_STORE_BYTES,
   MAX_TTL_MS,
   MIME_PAD_BYTES,
@@ -48,6 +55,7 @@ type BatchRow = {
   failed_attempts: number;
   grant_token: string | null;
   grant_expires_at: string | null;
+  client_key: string | null;
 };
 
 type FileRow = {
@@ -83,7 +91,7 @@ type UploadSessionRow = {
 };
 
 const ROOM_ERROR =
-  "There is not enough room. Everything stored here can total 10 GB.";
+  "There is not enough room. Everything stored here can total 20 GB.";
 
 function sha256Bytes(data: Buffer): Buffer {
   return createHash("sha256").update(data).digest();
@@ -135,29 +143,75 @@ function asBytes(value: unknown): Buffer {
   throw new Error("Missing chunk.");
 }
 
-async function storedBytes(sql: Sql): Promise<number> {
+async function estimatedStoredBytes(sql: Sql, clientKey?: string | null): Promise<number> {
+  if (clientKey) {
+    const rows = await sql<{ total: number }>`
+      select (
+        coalesce((select sum(octet_length(c.payload)) from sealed_file_chunks c
+          join sealed_files f on f.id = c.file_id
+          join sealed_batches b on b.id = f.batch_id
+          where b.client_key = ${clientKey}), 0)
+        + coalesce((select sum(octet_length(c.payload_bin)) from upload_chunks c
+          join upload_sessions s on s.id = c.upload_id
+          where s.client_ip = ${clientKey}), 0)
+        + coalesce((select sum(octet_length(c.payload)) from upload_chunks c
+          join upload_sessions s on s.id = c.upload_id
+          where s.client_ip = ${clientKey} and c.payload <> ''), 0)
+        + coalesce((select sum(octet_length(f.ciphertext)) from sealed_files f
+          join sealed_batches b on b.id = f.batch_id
+          where b.client_key = ${clientKey}
+            and f.ciphertext is not null and f.ciphertext <> ''), 0)
+        + (coalesce((select count(*) from sealed_file_chunks c
+          join sealed_files f on f.id = c.file_id
+          join sealed_batches b on b.id = f.batch_id
+          where b.client_key = ${clientKey}), 0)
+          + coalesce((select count(*) from upload_chunks c
+          join upload_sessions s on s.id = c.upload_id
+          where s.client_ip = ${clientKey}), 0)) * ${ESTIMATED_CHUNK_ROW_OVERHEAD_BYTES}
+        + coalesce((select count(*) from sealed_files f
+          join sealed_batches b on b.id = f.batch_id
+          where b.client_key = ${clientKey}), 0) * ${ESTIMATED_FILE_ROW_OVERHEAD_BYTES}
+        + coalesce((select count(*) from sealed_batches b where b.client_key = ${clientKey}), 0) * ${ESTIMATED_BATCH_ROW_OVERHEAD_BYTES}
+        + coalesce((select count(*) from upload_sessions s where s.client_ip = ${clientKey}), 0) * ${ESTIMATED_SESSION_ROW_OVERHEAD_BYTES}
+      )::float8 as total
+    `;
+    return asNumber(rows[0]?.total);
+  }
   const rows = await sql<{ total: number }>`
     select (
       coalesce((select sum(octet_length(payload)) from sealed_file_chunks), 0)
       + coalesce((select sum(octet_length(payload_bin)) from upload_chunks), 0)
       + coalesce((select sum(octet_length(payload)) from upload_chunks where payload <> ''), 0)
-      + coalesce((select sum(cipher_bytes) from sealed_files where cipher_bytes > 0), 0)
-      + coalesce((
-          select sum(octet_length(ciphertext)) from sealed_files
-          where coalesce(cipher_bytes, 0) = 0 and ciphertext is not null and ciphertext <> ''
-        ), 0)
+      + coalesce((select sum(octet_length(ciphertext)) from sealed_files
+          where ciphertext is not null and ciphertext <> ''), 0)
+      + (coalesce((select count(*) from sealed_file_chunks), 0)
+        + coalesce((select count(*) from upload_chunks), 0)) * ${ESTIMATED_CHUNK_ROW_OVERHEAD_BYTES}
+      + coalesce((select count(*) from sealed_files), 0) * ${ESTIMATED_FILE_ROW_OVERHEAD_BYTES}
+      + coalesce((select count(*) from sealed_batches), 0) * ${ESTIMATED_BATCH_ROW_OVERHEAD_BYTES}
+      + coalesce((select count(*) from upload_sessions), 0) * ${ESTIMATED_SESSION_ROW_OVERHEAD_BYTES}
     )::float8 as total
   `;
   return asNumber(rows[0]?.total);
 }
 
-async function storedChunkCount(sql: Sql): Promise<number> {
+async function clientStoredChunkCount(sql: Sql, clientKey: string): Promise<number> {
   const rows = await sql<{ total: number }>`
     select (
-      coalesce((select count(*) from sealed_file_chunks), 0)
-      + coalesce((select count(*) from upload_chunks), 0)
-      + coalesce((select count(*) from sealed_files where coalesce(cipher_bytes, 0) > 0), 0)
+      coalesce((select count(*) from sealed_file_chunks c
+        join sealed_files f on f.id = c.file_id
+        join sealed_batches b on b.id = f.batch_id
+        where b.client_key = ${clientKey}), 0)
+      + coalesce((select count(*) from upload_chunks c
+        join upload_sessions s on s.id = c.upload_id
+        where s.client_ip = ${clientKey}), 0)
     )::float8 as total
+  `;
+  return asNumber(rows[0]?.total);
+}
+
+async function clientStoredBatchCount(sql: Sql, clientKey: string): Promise<number> {
+  const rows = await sql<{ total: number }>`
+    select count(*)::float8 as total from sealed_batches where client_key = ${clientKey}
   `;
   return asNumber(rows[0]?.total);
 }
@@ -234,6 +288,9 @@ export async function purgeExpired(): Promise<void> {
     tables.push("sealed_file_chunks", "sealed_files", "sealed_batches");
   }
   if (tables.length > 0) await vacuumTables(sql, tables);
+  if (due.sessions > 0 && due.uploadVacuum === 0 && due.uploads === 0) {
+    await sql.query("VACUUM upload_sessions").catch(() => undefined);
+  }
 }
 
 export async function destroyFile(id: string): Promise<void> {
@@ -312,40 +369,31 @@ export async function startUploadSession(clientIp: string | null): Promise<{ upl
   const sql = await getSql();
   await withUploadQuotaLock(sql, async (lockedSql) => {
     const emptyCutoff = new Date(Date.now() - EMPTY_UPLOAD_TTL_MS).toISOString();
-    await lockedSql`
-      delete from upload_sessions s
-      where s.state = 'pending'
-        and s.had_chunks = false
-        and s.updated_at <= ${emptyCutoff}::timestamptz
-        and not exists (select 1 from upload_chunks c where c.upload_id = s.id)
-    `;
     const emptyTotal = await lockedSql<{ n: number }>`
       select count(*)::float8 as n from upload_sessions s
       where s.state = 'pending'
         and s.had_chunks = false
+        and s.updated_at > ${emptyCutoff}::timestamptz
         and not exists (select 1 from upload_chunks c where c.upload_id = s.id)
     `;
     if (asNumber(emptyTotal[0]?.n) >= MAX_EMPTY_UPLOADS) {
-      await lockedSql`
-        delete from upload_sessions
-        where id = (
-          select s.id from upload_sessions s
-          where s.state = 'pending'
-            and s.had_chunks = false
-            and not exists (select 1 from upload_chunks c where c.upload_id = s.id)
-          order by s.created_at
-          limit 1
-        )
-      `;
+      throw new Error("Too many uploads are in progress.");
     }
     if (clientKey) {
       const active = await lockedSql<{ n: number }>`
         select count(*)::float8 as n from upload_sessions
         where client_ip = ${clientKey} and state = 'pending'
+          and (had_chunks = true or updated_at > ${emptyCutoff}::timestamptz)
       `;
       if (asNumber(active[0]?.n) >= MAX_ACTIVE_UPLOADS_PER_IP) {
         throw new Error("Too many uploads are in progress from this address.");
       }
+      if ((await estimatedStoredBytes(lockedSql, clientKey)) + ESTIMATED_SESSION_ROW_OVERHEAD_BYTES > MAX_CLIENT_LOGICAL_BYTES) {
+        throw new Error("Too much is stored from this address.");
+      }
+    }
+    if ((await estimatedStoredBytes(lockedSql)) + ESTIMATED_SESSION_ROW_OVERHEAD_BYTES > MAX_STORE_BYTES) {
+      throw new Error(ROOM_ERROR);
     }
     await lockedSql`
       insert into upload_sessions (id, client_ip)
@@ -403,7 +451,7 @@ export async function storeChunk(input: {
   ) {
     throw new Error("Invalid chunk.");
   }
-  if (input.payload.length === 0 || input.payload.length > MAX_CHUNK_BYTES) {
+  if (input.payload.length <= GCM_TAG_BYTES || input.payload.length > MAX_CHUNK_BYTES) {
     throw new Error("Chunk is too large.");
   }
   const sql = await getSql();
@@ -438,15 +486,14 @@ export async function storeChunk(input: {
       `;
       if (asNumber(current[0]?.n) !== 0) throw new Error("Chunk already uploaded.");
       const pending = await lockedSql<{ n: number }>`
-        select count(*)::float8 as n from upload_chunks
+        select count(*)::float8 as n
+        from upload_chunks c
+        join upload_sessions s on s.id = c.upload_id
+        where s.state = 'pending'
       `;
       if (asNumber(pending[0]?.n) >= MAX_PENDING_CHUNKS) {
         discard = true;
         throw new Error("Too many uploads are in progress.");
-      }
-      if ((await storedChunkCount(lockedSql)) >= MAX_STORED_CHUNKS) {
-        discard = true;
-        throw new Error("Too many files are stored right now.");
       }
       if (session.client_ip) {
         const pendingForIp = await lockedSql<{ n: number }>`
@@ -459,11 +506,19 @@ export async function storeChunk(input: {
           discard = true;
           throw new Error("Too many uploads are in progress from this address.");
         }
+        if ((await clientStoredChunkCount(lockedSql, session.client_ip)) >= MAX_CLIENT_STORED_CHUNKS) {
+          discard = true;
+          throw new Error("Too many files are stored from this address.");
+        }
       }
-      const used = await storedBytes(lockedSql);
-      if (used + input.payload.length > MAX_STORE_BYTES) {
+      const billedBytes = input.payload.length + ESTIMATED_CHUNK_ROW_OVERHEAD_BYTES;
+      if ((await estimatedStoredBytes(lockedSql)) + billedBytes > MAX_STORE_BYTES) {
         discard = true;
         throw new Error(ROOM_ERROR);
+      }
+      if (session.client_ip && (await estimatedStoredBytes(lockedSql, session.client_ip)) + billedBytes > MAX_CLIENT_LOGICAL_BYTES) {
+        discard = true;
+        throw new Error("Too much is stored from this address.");
       }
       await lockedSql`
         insert into upload_chunks (upload_id, file_index, chunk_index, payload, iv, payload_bin)
@@ -571,7 +626,9 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
       }
       discard = true;
 
-      let uploadBytes = 0;
+      let uploadPlainBytes = 0;
+      let uploadCipherBytes = 0;
+      let uploadChunkCount = 0;
       const uploadedFiles = await lockedSql<{ file_index: number }>`
         select distinct file_index from upload_chunks
         where upload_id = ${input.uploadId}
@@ -598,24 +655,46 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
             throw new Error("Upload was incomplete.");
           }
           const len = asNumber(chunk.len);
-          if (len <= 0 || len > MAX_CHUNK_BYTES) throw new Error("Encrypted payload is invalid.");
-          uploadBytes += len;
-          if (uploadBytes > MAX_STORE_BYTES) throw new Error(ROOM_ERROR);
+          if (len <= GCM_TAG_BYTES || len > MAX_CHUNK_BYTES) throw new Error("Encrypted payload is invalid.");
+          if (index < file.chunkCount - 1 && len !== MAX_CHUNK_BYTES) {
+            throw new Error("Encrypted payload is invalid.");
+          }
+          uploadCipherBytes += len;
+          uploadChunkCount += 1;
+          uploadPlainBytes += len - GCM_TAG_BYTES;
+          if (uploadPlainBytes > MAX_BATCH_BYTES) throw new Error(ROOM_ERROR);
         }
       }
-      if ((await storedBytes(lockedSql)) > MAX_STORE_BYTES) throw new Error(ROOM_ERROR);
-      if ((await storedChunkCount(lockedSql)) > MAX_STORED_CHUNKS) {
-        throw new Error("Too many files are stored right now.");
+      const metadataBytes = ESTIMATED_BATCH_ROW_OVERHEAD_BYTES + input.files.length * ESTIMATED_FILE_ROW_OVERHEAD_BYTES;
+      const copiedChunkBytes = uploadCipherBytes + uploadChunkCount * ESTIMATED_CHUNK_ROW_OVERHEAD_BYTES;
+      // Finished chunks remain in upload_chunks until the expiry worker wipes
+      // them, so reserve the second live copy before sealing the batch.
+      if ((await estimatedStoredBytes(lockedSql)) + copiedChunkBytes + metadataBytes > MAX_STORE_BYTES) {
+        throw new Error(ROOM_ERROR);
+      }
+      if (session.client_ip) {
+        // Client quotas are logical ownership quotas: these chunks move from
+        // pending to sealed ownership. The global quota above reserves the
+        // temporary second physical copy until cleanup runs.
+        if ((await estimatedStoredBytes(lockedSql, session.client_ip)) + metadataBytes > MAX_CLIENT_LOGICAL_BYTES) {
+          throw new Error("Too much is stored from this address.");
+        }
+        if (await clientStoredChunkCount(lockedSql, session.client_ip) > MAX_CLIENT_STORED_CHUNKS) {
+          throw new Error("Too many files are stored from this address.");
+        }
+        if (await clientStoredBatchCount(lockedSql, session.client_ip) >= MAX_CLIENT_STORED_BATCHES) {
+          throw new Error("Too many files are stored from this address.");
+        }
       }
 
       const batchId = randomBytes(16).toString("hex");
       const expires = new Date(input.expiresAt).toISOString();
       await lockedSql`
         insert into sealed_batches (
-          id, salt_auth, auth_hash, salt_enc, expires_at, max_downloads
+          id, salt_auth, auth_hash, salt_enc, expires_at, max_downloads, client_key
         ) values (
           ${batchId}, ${input.saltAuth}, ${input.authHash}, ${input.saltEnc},
-          ${expires}::timestamptz, ${input.maxDownloads}
+          ${expires}::timestamptz, ${input.maxDownloads}, ${session.client_ip}
         )
       `;
 
@@ -638,10 +717,6 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
           insert into sealed_file_chunks (file_id, chunk_index, iv, payload)
           select ${fileId}, chunk_index, iv, payload_bin
           from upload_chunks
-          where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
-        `;
-        await lockedSql`
-          delete from upload_chunks
           where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
         `;
       }

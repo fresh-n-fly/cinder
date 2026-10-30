@@ -36,7 +36,7 @@ Limits, as shipped:
 - Any file type
 - Any size per file
 - 100 files in one seal
-- 10 GB combined for everything stored on the service at once, including uploads still in progress
+- 20 GB combined for everything stored on the service at once, including uploads still in progress
 - Password: at least 12 characters, with a number and a special character
 - Expiry: up to 30 days, entered as day/month/year in GMT
 
@@ -98,7 +98,7 @@ If `/etc/letsencrypt/live/` already contains a certificate, the installer uses t
 
 The installer does not open port 3000. If UFW is already on, it allows OpenSSH and Nginx. If UFW is off, it leaves the firewall alone. It does not delete an existing database.
 
-The generated Nginx site rate-limits only JSON unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance. Multipart chunk downloads are not counted by that limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
+The generated Nginx site rate-limits JSON unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance, applies a looser limit to chunk downloads, and rate-limits `/api/seal` traffic. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
 
 To see or clear those bans:
 
@@ -408,7 +408,7 @@ A dump taken before a seal is cleared still holds that ciphertext. Keep backup r
 
 ### Disk
 
-Plan database disk for the ciphertext. New seals are stored as encrypted chunks (`bytea`), one slice per row, so a download never loads a whole file into memory. Names and types are fixed-size ciphertext, so their length is hidden. The service refuses a new upload when everything already stored, combined, would pass 10 GB. Monitor `pg_database_size('cinder')`.
+Plan database disk for the ciphertext. New seals are stored as encrypted chunks (`bytea`), one slice per row, so a download never loads a whole file into memory. Names and types are fixed-size ciphertext, so their length is hidden. The service refuses a new upload when the estimated stored footprint, including row overhead, would pass 20 GB. Monitor `pg_database_size('cinder')`.
 
 ## Security notes
 

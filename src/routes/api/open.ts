@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { fetchFileChunk, unlockBatch } from "@/lib/vault.server";
+import { MAX_OPEN_FORM_BODY_BYTES, MAX_OPEN_JSON_BODY_BYTES } from "@/lib/constants";
 
 function asString(value: FormDataEntryValue | null): string {
   return typeof value === "string" ? value : "";
@@ -22,6 +23,43 @@ function clientIp(request: Request): string | null {
   return raw;
 }
 
+function bodyTooLarge(request: Request, maxBytes: number): boolean {
+  const raw = request.headers.get("content-length");
+  if (!raw) return false;
+  const bytes = Number.parseInt(raw, 10);
+  return Number.isFinite(bytes) && bytes > maxBytes;
+}
+
+async function readBodyBytes(request: Request, maxBytes: number): Promise<Uint8Array> {
+  if (bodyTooLarge(request, maxBytes)) throw new Error("Request body is too large.");
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error("Request body is too large.");
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function requestFromBytes(request: Request, body: Uint8Array): Request {
+  const buffer = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
+  return new Request(request.url, { method: request.method, headers: request.headers, body: buffer });
+}
+
 export const Route = createFileRoute("/api/open")({
   server: {
     handlers: {
@@ -29,7 +67,7 @@ export const Route = createFileRoute("/api/open")({
         const contentType = request.headers.get("content-type") || "";
         try {
           if (isJsonContentType(contentType)) {
-            const body = (await request.json()) as Record<string, unknown>;
+            const body = JSON.parse(new TextDecoder().decode(await readBodyBytes(request, MAX_OPEN_JSON_BODY_BYTES))) as Record<string, unknown>;
             if (body.intent !== "unlock") {
               return Response.json({ error: "Unknown action." }, { status: 400 });
             }
@@ -56,7 +94,7 @@ export const Route = createFileRoute("/api/open")({
             );
           }
 
-          const form = await request.formData();
+          const form = await requestFromBytes(request, await readBodyBytes(request, MAX_OPEN_FORM_BODY_BYTES)).formData();
           if (asString(form.get("intent")) !== "chunk") {
             return Response.json({ error: "Unknown action." }, { status: 400 });
           }
@@ -82,7 +120,7 @@ export const Route = createFileRoute("/api/open")({
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : "Could not open the file.";
-          return Response.json({ error: message }, { status: 400 });
+          return Response.json({ error: message }, { status: message === "Request body is too large." ? 413 : 400 });
         }
       },
     },

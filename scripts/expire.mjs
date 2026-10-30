@@ -42,6 +42,9 @@ async function main() {
       if (!SECRET_TABLES.includes(table)) continue;
       await client.query(`VACUUM FULL ${table}`);
     }
+    if (due.sessions > 0 && due.uploadVacuum === 0 && due.uploads === 0) {
+      await client.query("VACUUM upload_sessions");
+    }
     const removed = due.batches + due.legacy + due.uploads + due.sessions;
     if (removed > 0) {
       console.log(

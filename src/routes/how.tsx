@@ -27,7 +27,7 @@ const SECTIONS = [
   },
   {
     title: "What you can send",
-    body: "Any file type, and any size per file. One seal can hold up to 100 files. Everything stored on the server at once — every seal, combined — stays within 10 GB.",
+    body: "Any file type, and any size per file. One seal can hold up to 100 files. Everything stored on the server at once — every seal, combined — stays within 20 GB.",
   },
   {
     title: "What Cinder is not",

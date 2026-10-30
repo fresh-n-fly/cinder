@@ -226,7 +226,9 @@ export async function wipeDue(query) {
 export async function wipeAbandonedUploads(query) {
   const sessions = await query(
     `select id, had_chunks from upload_sessions
-     where state <> 'pending' or updated_at < now() - interval '2 hours'
+     where state <> 'pending'
+        or (had_chunks = false and updated_at < now() - interval '5 minutes')
+        or (had_chunks = true and updated_at < now() - interval '2 hours')
      order by updated_at
      for update`,
   );
