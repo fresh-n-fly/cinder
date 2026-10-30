@@ -162,7 +162,9 @@ say "Abandoned upload sessions older than 2 hours"
 psql_cmd << 'SQL'
 SELECT count(*) AS abandoned_upload_sessions
 FROM upload_sessions
-WHERE state <> 'pending' OR updated_at < now() - interval '2 hours';
+WHERE state <> 'pending'
+   OR (had_chunks = false AND updated_at < now() - interval '5 minutes')
+   OR (had_chunks = true AND updated_at < now() - interval '2 hours');
 SQL
 
 say "Chunks whose file row is gone"
@@ -188,7 +190,9 @@ SELECT
       WHERE (s.id IS NULL AND c.created_at < now() - interval '2 hours')
          OR (s.id IS NOT NULL AND (s.state <> 'pending' OR s.updated_at < now() - interval '2 hours')))
   + (SELECT count(*) FROM upload_sessions
-      WHERE state <> 'pending' OR updated_at < now() - interval '2 hours')
+      WHERE state <> 'pending'
+         OR (had_chunks = false AND updated_at < now() - interval '5 minutes')
+         OR (had_chunks = true AND updated_at < now() - interval '2 hours'))
   + (SELECT count(*) FROM sealed_file_chunks c
       WHERE NOT EXISTS (SELECT 1 FROM sealed_files f WHERE f.id = c.file_id));
 SQL
