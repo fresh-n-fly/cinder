@@ -41,12 +41,12 @@ Options:
   --prefix DIR    Install directory (default: /opt/cinder)
   -h, --help      Show this help
 
-With no options the site is served on ports 80 and 443. If
+With no options the site is served on HTTPS port 443 and HTTP redirects there. If
 /etc/letsencrypt/live/ already holds a certificate, that certificate and its
 domain name are used. Otherwise HTTPS uses a self-signed certificate.
 Pass --domain and --email when a DNS name already points here and port 80
 is reachable from the internet. If Let's Encrypt cannot issue a certificate,
-HTTP and self-signed HTTPS stay in place. When more than one certificate is
+HTTP still redirects to self-signed HTTPS. When more than one certificate is
 already present, pass --domain to choose it.
 EOF
 }
@@ -164,7 +164,7 @@ done
 # --no-upgrade installs anything missing and leaves packages that are already
 # installed at their current version. A Cinder install should not upgrade libc.
 apt-get install -y --no-upgrade "${APT_OPTS[@]}" \
-  ca-certificates curl xz-utils openssl nginx postgresql rsync iproute2
+  ca-certificates curl xz-utils openssl nginx postgresql rsync iproute2 fail2ban python3-systemd
 
 as_user() {
   local user=$1
@@ -469,12 +469,21 @@ sed \
   -e "s|^Documentation=.*|Documentation=file://${PREFIX}/README.md|" \
   "$PREFIX/deploy/cinder-expire.service" > /etc/systemd/system/cinder-expire.service
 cp "$PREFIX/deploy/cinder-expire.timer" /etc/systemd/system/cinder-expire.timer
+
+say "Configuring Fail2ban."
+install -D -m 644 "$PREFIX/deploy/fail2ban/cinder-unlock.conf" /etc/fail2ban/filter.d/cinder-unlock.conf
+install -D -m 644 "$PREFIX/deploy/fail2ban/cinder.local" /etc/fail2ban/jail.d/cinder.local
+fail2ban-client -t || die "Fail2ban rejected the Cinder jail configuration."
+
 systemctl daemon-reload
 systemctl enable cinder
 systemctl enable cinder-expire.timer
+systemctl enable fail2ban
 systemctl reset-failed cinder || true
 systemctl restart cinder
 systemctl restart cinder-expire.timer
+systemctl restart fail2ban || die "Fail2ban did not start. Check: journalctl -u fail2ban -e"
+fail2ban-client status cinder-unlock >/dev/null || die "Fail2ban did not load the cinder-unlock jail."
 systemctl start cinder-expire.service || die "Could not delete expired seals. Check: journalctl -u cinder-expire.service"
 
 app_up=0
@@ -697,6 +706,12 @@ write_nginx() {
   {
     printf '%s\n' "# Written by deploy/install.sh. Run that script again to replace this file."
     printf '%s\n' "# Uploads arrive in pieces of about 4 MB. client_max_body_size must stay at least 8m."
+    printf '%s\n' "# JSON POSTs to /api/open are unlock attempts; multipart chunk downloads are not rate-limited."
+    printf '%s\n' "map \$http_content_type \$cinder_unlock_key {"
+    printf '%s\n' "    default \"\";"
+    printf '%s\n' "    ~*^application/json \$binary_remote_addr;"
+    printf '%s\n' "}"
+    printf '%s\n' "limit_req_zone \$cinder_unlock_key zone=cinder_unlock:10m rate=10r/m;"
     printf '%s\n' "upstream cinder {"
     printf '%s\n' "    server 127.0.0.1:3000;"
     printf '%s\n' "    keepalive 16;"
@@ -739,6 +754,21 @@ ${le_ssl}
     client_max_body_size 8m;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
+
+    location = /api/open {
+        limit_req zone=cinder_unlock burst=5 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://cinder;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection        "";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
 
     location / {
         proxy_pass http://cinder;
@@ -785,6 +815,21 @@ ${http2_line}
     client_max_body_size 8m;
     access_log /var/log/nginx/cinder.access.log combined;
     error_log  /var/log/nginx/cinder.error.log;
+
+    location = /api/open {
+        limit_req zone=cinder_unlock burst=5 nodelay;
+        limit_req_status 429;
+
+        proxy_pass http://cinder;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Connection        "";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
 
     location / {
         proxy_pass http://cinder;
