@@ -483,7 +483,18 @@ systemctl reset-failed cinder || true
 systemctl restart cinder
 systemctl restart cinder-expire.timer
 systemctl restart fail2ban || die "Fail2ban did not start. Check: journalctl -u fail2ban -e"
-fail2ban-client status cinder-unlock >/dev/null || die "Fail2ban did not load the cinder-unlock jail."
+fail2ban_ready=0
+for _ in $(seq 1 20); do
+  if fail2ban-client ping >/dev/null 2>&1 && fail2ban-client status cinder-unlock >/dev/null 2>&1; then
+    fail2ban_ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$fail2ban_ready" != 1 ]]; then
+  journalctl -u fail2ban -n 40 --no-pager >&2 || true
+  die "Fail2ban did not load the cinder-unlock jail."
+fi
 systemctl start cinder-expire.service || die "Could not delete expired seals. Check: journalctl -u cinder-expire.service"
 
 app_up=0
