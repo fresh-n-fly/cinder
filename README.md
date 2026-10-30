@@ -80,7 +80,7 @@ cd cinder
 sudo bash deploy/install.sh
 ```
 
-The script installs Node.js 22, PostgreSQL, and Nginx, builds the app, and serves it on HTTPS port 443 while port 80 redirects to HTTPS. Node listens only on `127.0.0.1:3000`. That port is the application. PostgreSQL listens only on `127.0.0.1:5432`.
+The script installs Node.js 22, PostgreSQL, Nginx, and Fail2ban, builds the app, and serves it on HTTPS port 443 while port 80 redirects to HTTPS. Node listens only on `127.0.0.1:3000`. That port is the application. PostgreSQL listens only on `127.0.0.1:5432`.
 
 Run the same command again to update Cinder. The database and `/opt/cinder/.env` are kept. The script does not print the database password.
 
@@ -98,6 +98,15 @@ If `/etc/letsencrypt/live/` already contains a certificate, the installer uses t
 
 The installer does not open port 3000. If UFW is already on, it allows OpenSSH and Nginx. If UFW is off, it leaves the firewall alone. It does not delete an existing database.
 
+The generated Nginx site rate-limits only JSON unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance. Multipart chunk downloads are not counted by that limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes.
+
+To see or clear those bans:
+
+```bash
+sudo bash deploy/fail2ban-status.sh
+sudo bash deploy/fail2ban-flush.sh --yes
+```
+
 The steps below are the same install, run by hand.
 
 ## Manual production install (Ubuntu 24.04 LTS or Debian 12)
@@ -111,7 +120,7 @@ Replace `files.example.com` with your hostname throughout.
 ```bash
 sudo apt update
 sudo apt upgrade -y
-sudo apt install -y ca-certificates curl gnupg ufw git unzip
+sudo apt install -y ca-certificates curl gnupg ufw git unzip fail2ban python3-systemd
 ```
 
 ### 2. Create a dedicated user

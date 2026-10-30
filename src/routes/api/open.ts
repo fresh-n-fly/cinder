@@ -10,6 +10,14 @@ function asInt(value: unknown): number {
   return Number.isFinite(n) ? n : NaN;
 }
 
+function clientIp(request: Request): string | null {
+  const raw =
+    request.headers.get("x-real-ip")?.trim() ||
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  if (!raw || raw.length > 45 || !/^[0-9a-fA-F:.]+$/.test(raw)) return null;
+  return raw;
+}
+
 export const Route = createFileRoute("/api/open")({
   server: {
     handlers: {
@@ -23,6 +31,10 @@ export const Route = createFileRoute("/api/open")({
             }
             const result = await unlockBatch(String(body.id ?? ""), String(body.verifier ?? ""));
             if (!result.ok) {
+              const ip = clientIp(request);
+              if (ip && result.remainingAttempts !== undefined) {
+                console.warn(`[cinder] unlock_failed ip=${ip} remaining=${result.remainingAttempts}`);
+              }
               return Response.json(
                 { error: result.error, remainingAttempts: result.remainingAttempts },
                 { status: result.status, headers: { "Cache-Control": "no-store" } },
