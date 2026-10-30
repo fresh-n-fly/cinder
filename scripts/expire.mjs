@@ -34,7 +34,7 @@ async function main() {
     await client.query("commit");
     inTransaction = false;
     const tables = [];
-    if (due.uploads > 0 || due.sessions > 0) tables.push("upload_chunks", "upload_sessions");
+    if (due.uploads > 0 || due.uploadVacuum > 0) tables.push("upload_chunks", "upload_sessions");
     if (due.batches > 0 || due.legacy > 0) {
       tables.push("sealed_file_chunks", "sealed_files", "sealed_batches");
     }

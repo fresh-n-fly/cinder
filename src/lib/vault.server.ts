@@ -1,11 +1,12 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   CHUNK_BYTES,
+  EMPTY_UPLOAD_TTL_MS,
   GCM_TAG_BYTES,
   GRANT_TTL_MS,
   MAX_BATCH_FILES,
-  MAX_ACTIVE_UPLOADS,
   MAX_ACTIVE_UPLOADS_PER_IP,
+  MAX_EMPTY_UPLOADS,
   MAX_CHUNKS_PER_FILE,
   MAX_CHUNKS_TOTAL,
   MAX_CHUNK_BYTES,
@@ -77,6 +78,7 @@ type UploadSessionRow = {
   id: string;
   client_ip: string | null;
   state: string;
+  had_chunks: boolean;
   updated_at: string;
 };
 
@@ -85,6 +87,10 @@ const ROOM_ERROR =
 
 function sha256Bytes(data: Buffer): Buffer {
   return createHash("sha256").update(data).digest();
+}
+
+function uploadClientKey(clientIp: string | null): string | null {
+  return clientIp ? sha256Bytes(Buffer.from(clientIp)).toString("hex") : null;
 }
 
 function isHex(value: string, length: number): boolean {
@@ -223,7 +229,7 @@ export async function purgeExpired(): Promise<void> {
     return wipeDue(asQuery(lockedSql));
   });
   const tables: string[] = [];
-  if (due.uploads > 0 || due.sessions > 0) tables.push("upload_chunks", "upload_sessions");
+  if (due.uploads > 0 || due.uploadVacuum > 0) tables.push("upload_chunks", "upload_sessions");
   if (due.batches > 0 || due.legacy > 0) {
     tables.push("sealed_file_chunks", "sealed_files", "sealed_batches");
   }
@@ -302,19 +308,40 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
 
 export async function startUploadSession(clientIp: string | null): Promise<{ uploadId: string }> {
   const uploadId = randomBytes(16).toString("hex");
+  const clientKey = uploadClientKey(clientIp);
   const sql = await getSql();
   await withUploadQuotaLock(sql, async (lockedSql) => {
-    const activeTotal = await lockedSql<{ n: number }>`
-      select count(*)::float8 as n from upload_sessions
-      where state = 'pending'
+    const emptyCutoff = new Date(Date.now() - EMPTY_UPLOAD_TTL_MS).toISOString();
+    await lockedSql`
+      delete from upload_sessions s
+      where s.state = 'pending'
+        and s.had_chunks = false
+        and s.updated_at <= ${emptyCutoff}::timestamptz
+        and not exists (select 1 from upload_chunks c where c.upload_id = s.id)
     `;
-    if (asNumber(activeTotal[0]?.n) >= MAX_ACTIVE_UPLOADS) {
-      throw new Error("Too many uploads are in progress.");
+    const emptyTotal = await lockedSql<{ n: number }>`
+      select count(*)::float8 as n from upload_sessions s
+      where s.state = 'pending'
+        and s.had_chunks = false
+        and not exists (select 1 from upload_chunks c where c.upload_id = s.id)
+    `;
+    if (asNumber(emptyTotal[0]?.n) >= MAX_EMPTY_UPLOADS) {
+      await lockedSql`
+        delete from upload_sessions
+        where id = (
+          select s.id from upload_sessions s
+          where s.state = 'pending'
+            and s.had_chunks = false
+            and not exists (select 1 from upload_chunks c where c.upload_id = s.id)
+          order by s.created_at
+          limit 1
+        )
+      `;
     }
-    if (clientIp) {
+    if (clientKey) {
       const active = await lockedSql<{ n: number }>`
         select count(*)::float8 as n from upload_sessions
-        where client_ip = ${clientIp} and state = 'pending'
+        where client_ip = ${clientKey} and state = 'pending'
       `;
       if (asNumber(active[0]?.n) >= MAX_ACTIVE_UPLOADS_PER_IP) {
         throw new Error("Too many uploads are in progress from this address.");
@@ -322,7 +349,7 @@ export async function startUploadSession(clientIp: string | null): Promise<{ upl
     }
     await lockedSql`
       insert into upload_sessions (id, client_ip)
-      values (${uploadId}, ${clientIp})
+      values (${uploadId}, ${clientKey})
     `;
   });
   return { uploadId };
@@ -384,13 +411,14 @@ export async function storeChunk(input: {
   try {
     await withUploadQuotaLock(sql, async (lockedSql) => {
       const sessions = await lockedSql<UploadSessionRow>`
-        select id, client_ip, state, updated_at::text as updated_at from upload_sessions
+        select id, client_ip, state, had_chunks, updated_at::text as updated_at from upload_sessions
         where id = ${input.uploadId}
         for update
       `;
       const session = sessions[0];
       if (!session || session.state !== "pending") throw new Error("Invalid upload.");
-      if (new Date(toIso(session.updated_at)).getTime() <= Date.now() - UPLOAD_TTL_MS) {
+      const sessionTtl = session.had_chunks ? UPLOAD_TTL_MS : EMPTY_UPLOAD_TTL_MS;
+      if (new Date(toIso(session.updated_at)).getTime() <= Date.now() - sessionTtl) {
         discard = true;
         throw new Error("Upload expired.");
       }
@@ -442,7 +470,7 @@ export async function storeChunk(input: {
         values (${input.uploadId}, ${input.fileIndex}, ${input.chunkIndex}, '', ${input.iv}, ${input.payload})
       `;
       await lockedSql`
-        update upload_sessions set updated_at = now()
+        update upload_sessions set had_chunks = true, updated_at = now()
         where id = ${input.uploadId}
       `;
     });
@@ -530,19 +558,32 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
   try {
     return await withUploadQuotaLock(sql, async (lockedSql) => {
       const sessions = await lockedSql<UploadSessionRow>`
-        select id, client_ip, state, updated_at::text as updated_at from upload_sessions
+        select id, client_ip, state, had_chunks, updated_at::text as updated_at from upload_sessions
         where id = ${input.uploadId}
         for update
       `;
       const session = sessions[0];
       if (!session || session.state !== "pending") throw new Error("Invalid upload.");
-      if (new Date(toIso(session.updated_at)).getTime() <= Date.now() - UPLOAD_TTL_MS) {
+      const sessionTtl = session.had_chunks ? UPLOAD_TTL_MS : EMPTY_UPLOAD_TTL_MS;
+      if (new Date(toIso(session.updated_at)).getTime() <= Date.now() - sessionTtl) {
         discard = true;
         throw new Error("Upload expired.");
       }
       discard = true;
 
       let uploadBytes = 0;
+      const uploadedFiles = await lockedSql<{ file_index: number }>`
+        select distinct file_index from upload_chunks
+        where upload_id = ${input.uploadId}
+        order by file_index
+      `;
+      const expectedFiles = new Set(input.files.map((file) => file.fileIndex));
+      if (
+        uploadedFiles.length !== expectedFiles.size ||
+        uploadedFiles.some((file) => !expectedFiles.has(file.file_index))
+      ) {
+        throw new Error("Upload was incomplete.");
+      }
       for (const file of input.files) {
         const chunks = await lockedSql<{ chunk_index: number; len: number; iv: string }>`
           select chunk_index, octet_length(payload_bin)::float8 as len, iv
@@ -597,6 +638,10 @@ export async function finishUpload(input: FinishInput): Promise<{ id: string }> 
           insert into sealed_file_chunks (file_id, chunk_index, iv, payload)
           select ${fileId}, chunk_index, iv, payload_bin
           from upload_chunks
+          where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
+        `;
+        await lockedSql`
+          delete from upload_chunks
           where upload_id = ${input.uploadId} and file_index = ${file.fileIndex}
         `;
       }
@@ -710,10 +755,17 @@ export async function unlockBatch(id: string, verifierHex: string): Promise<Unlo
       const updated = await sql<{ failed_attempts: number }>`
         update sealed_batches
         set failed_attempts = failed_attempts + 1
-        where id = ${id}
+        where id = ${id} and failed_attempts < ${MAX_FAILED_ATTEMPTS}
         returning failed_attempts
       `;
-      const attempts = updated[0]?.failed_attempts ?? batch.failed_attempts + 1;
+      const attempts = updated[0]?.failed_attempts;
+      if (attempts === undefined) {
+        return {
+          ok: false,
+          error: "This file is locked after too many incorrect passwords.",
+          status: 423,
+        };
+      }
       const left = Math.max(0, MAX_FAILED_ATTEMPTS - attempts);
       return {
         ok: false,
@@ -736,10 +788,21 @@ export async function unlockBatch(id: string, verifierHex: string): Promise<Unlo
       where id = ${id}
         and download_count < max_downloads
         and expires_at > now()
+        and failed_attempts < ${MAX_FAILED_ATTEMPTS}
       returning download_count, max_downloads
     `;
     const claim = claimed[0];
     if (!claim) {
+      const current = await sql<{ failed_attempts: number }>`
+        select failed_attempts from sealed_batches where id = ${id}
+      `;
+      if ((current[0]?.failed_attempts ?? 0) >= MAX_FAILED_ATTEMPTS) {
+        return {
+          ok: false,
+          error: "This file is locked after too many incorrect passwords.",
+          status: 423,
+        };
+      }
       return { ok: false, error: "This file is gone.", status: 404 };
     }
     const remainingAfter = Math.max(0, claim.max_downloads - claim.download_count);
@@ -765,83 +828,96 @@ export async function unlockBatch(id: string, verifierHex: string): Promise<Unlo
 
 async function unlockLegacyFile(id: string, verifierHex: string): Promise<UnlockResult> {
   const sql = await getSql();
-  const rows = await sql<FileRow>`
-    select id, batch_id, original_name, mime_type, size_bytes, ciphertext, salt_enc, iv,
-           salt_auth, auth_hash, expires_at::text as expires_at, max_downloads,
-           download_count, failed_attempts, cipher_bytes, chunk_count, file_nonce,
-           name_iv, name_ct, mime_iv, mime_ct
-    from sealed_files
-    where id = ${id} and batch_id is null
-  `;
-  const row = rows[0];
-  if (!row) return { ok: false, error: "This file is gone.", status: 404 };
-  if (isExpired(toIso(row.expires_at)) || remainingOf(row) <= 0) {
-    return { ok: false, error: "This file is gone.", status: 404 };
-  }
-  if (row.failed_attempts >= MAX_FAILED_ATTEMPTS) {
-    return {
-      ok: false,
-      error: "This file is locked after too many incorrect passwords.",
-      status: 423,
-    };
-  }
-  if (!verifierMatches(verifierHex, row.auth_hash)) {
-    const updated = await sql<{ failed_attempts: number }>`
-      update sealed_files
-      set failed_attempts = failed_attempts + 1
-      where id = ${id}
-      returning failed_attempts
+  return sql.transaction(async (lockedSql) => {
+    const rows = await lockedSql<FileRow>`
+      select id, batch_id, original_name, mime_type, size_bytes, ciphertext, salt_enc, iv,
+             salt_auth, auth_hash, expires_at::text as expires_at, max_downloads,
+             download_count, failed_attempts, cipher_bytes, chunk_count, file_nonce,
+             name_iv, name_ct, mime_iv, mime_ct
+      from sealed_files
+      where id = ${id} and batch_id is null
+      for update
     `;
-    const attempts = updated[0]?.failed_attempts ?? row.failed_attempts + 1;
-    const left = Math.max(0, MAX_FAILED_ATTEMPTS - attempts);
-    return {
-      ok: false,
-      error:
-        left === 0
-          ? "This file is locked after too many incorrect passwords."
-          : "Incorrect password.",
-      status: left === 0 ? 423 : 401,
-      remainingAttempts: left,
-    };
-  }
+    const row = rows[0];
+    if (!row) return { ok: false, error: "This file is gone.", status: 404 };
+    if (isExpired(toIso(row.expires_at)) || remainingOf(row) <= 0) {
+      return { ok: false, error: "This file is gone.", status: 404 };
+    }
+    if (row.failed_attempts >= MAX_FAILED_ATTEMPTS) {
+      return {
+        ok: false,
+        error: "This file is locked after too many incorrect passwords.",
+        status: 423,
+      };
+    }
+    if (!verifierMatches(verifierHex, row.auth_hash)) {
+      const updated = await lockedSql<{ failed_attempts: number }>`
+        update sealed_files
+        set failed_attempts = failed_attempts + 1
+        where id = ${id} and failed_attempts < ${MAX_FAILED_ATTEMPTS}
+        returning failed_attempts
+      `;
+      const attempts = updated[0]?.failed_attempts;
+      if (attempts === undefined) {
+        return {
+          ok: false,
+          error: "This file is locked after too many incorrect passwords.",
+          status: 423,
+        };
+      }
+      const left = Math.max(0, MAX_FAILED_ATTEMPTS - attempts);
+      return {
+        ok: false,
+        error:
+          left === 0
+            ? "This file is locked after too many incorrect passwords."
+            : "Incorrect password.",
+        status: left === 0 ? 423 : 401,
+        remainingAttempts: left,
+      };
+    }
 
-  const claimed = await sql<{ download_count: number; max_downloads: number }>`
-    update sealed_files
-    set download_count = download_count + 1
-    where id = ${id}
-      and download_count < max_downloads
-      and expires_at > now()
-    returning download_count, max_downloads
-  `;
-  const claim = claimed[0];
-  if (!claim) {
-    return { ok: false, error: "This file is gone.", status: 404 };
-  }
-  const remainingAfter = Math.max(0, claim.max_downloads - claim.download_count);
-  const ticket = randomBytes(16).toString("hex");
-  await sql`
-    insert into sealed_batches (
-      id, salt_auth, auth_hash, salt_enc, expires_at, max_downloads,
-      download_count, grant_token, grant_expires_at
-    ) values (
-      ${id}, ${row.salt_auth}, ${row.auth_hash}, ${row.salt_enc},
-      ${toIso(row.expires_at)}::timestamptz, ${row.max_downloads},
-      ${claim.download_count}, ${ticket}, ${new Date(Date.now() + GRANT_TTL_MS).toISOString()}::timestamptz
-    )
-    on conflict (id) do update set
-      grant_token = excluded.grant_token,
-      grant_expires_at = excluded.grant_expires_at,
-      download_count = excluded.download_count
-  `;
-  await sql`update sealed_files set batch_id = ${id} where id = ${id}`;
-  return {
-    ok: true,
-    ticket,
-    remainingAfter,
-    lastAccess: remainingAfter <= 0,
-    saltEnc: row.salt_enc,
-    files: [presentFile(row)],
-  };
+    const claimed = await lockedSql<{ download_count: number; max_downloads: number }>`
+      update sealed_files
+      set download_count = download_count + 1
+      where id = ${id}
+        and download_count < max_downloads
+        and expires_at > now()
+        and failed_attempts < ${MAX_FAILED_ATTEMPTS}
+      returning download_count, max_downloads
+    `;
+    const claim = claimed[0];
+    if (!claim) {
+      return { ok: false, error: "This file is gone.", status: 404 };
+    }
+    const remainingAfter = Math.max(0, claim.max_downloads - claim.download_count);
+    const ticket = randomBytes(16).toString("hex");
+    await lockedSql`
+      insert into sealed_batches (
+        id, salt_auth, auth_hash, salt_enc, expires_at, max_downloads,
+        download_count, grant_token, grant_expires_at, failed_attempts
+      ) values (
+        ${id}, ${row.salt_auth}, ${row.auth_hash}, ${row.salt_enc},
+        ${toIso(row.expires_at)}::timestamptz, ${row.max_downloads},
+        ${claim.download_count}, ${ticket}, ${new Date(Date.now() + GRANT_TTL_MS).toISOString()}::timestamptz,
+        ${row.failed_attempts}
+      )
+      on conflict (id) do update set
+        grant_token = excluded.grant_token,
+        grant_expires_at = excluded.grant_expires_at,
+        download_count = excluded.download_count,
+        failed_attempts = excluded.failed_attempts
+    `;
+    await lockedSql`update sealed_files set batch_id = ${id} where id = ${id}`;
+    return {
+      ok: true,
+      ticket,
+      remainingAfter,
+      lastAccess: remainingAfter <= 0,
+      saltEnc: row.salt_enc,
+      files: [presentFile(row)],
+    };
+  });
 }
 
 export type FetchResult =

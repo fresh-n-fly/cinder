@@ -204,7 +204,7 @@ const DUE_LEGACY = `
  * Delete every abandoned upload, expired seal, and used-up seal.
  * A used-up seal stays until its download ticket has ended.
  * @param {Query} query
- * @returns {Promise<{ uploads: number, sessions: number, batches: number, legacy: number }>}
+ * @returns {Promise<{ uploads: number, uploadVacuum: number, sessions: number, batches: number, legacy: number }>}
  */
 export async function wipeDue(query) {
   const uploads = await wipeAbandonedUploads(query);
@@ -216,22 +216,24 @@ export async function wipeDue(query) {
   for (const row of legacy) {
     await wipeFile(query, String(row.id));
   }
-  return { uploads: uploads.chunks, sessions: uploads.sessions, batches: batches.length, legacy: legacy.length };
+  return { uploads: uploads.chunks, uploadVacuum: uploads.vacuum, sessions: uploads.sessions, batches: batches.length, legacy: legacy.length };
 }
 
 /**
  * @param {Query} query
- * @returns {Promise<{ chunks: number, sessions: number }>}
+ * @returns {Promise<{ chunks: number, vacuum: number, sessions: number }>}
  */
 export async function wipeAbandonedUploads(query) {
   const sessions = await query(
-    `select id from upload_sessions
+    `select id, had_chunks from upload_sessions
      where state <> 'pending' or updated_at < now() - interval '2 hours'
      order by updated_at
      for update`,
   );
   let removed = 0;
+  let vacuum = 0;
   for (const row of sessions) {
+    if (row.had_chunks) vacuum += 1;
     removed += await wipeUpload(query, String(row.id));
   }
   const rows = await query(
@@ -249,7 +251,8 @@ export async function wipeAbandonedUploads(query) {
       row.chunk_index,
     ]);
   }
-  return { chunks: removed, sessions: sessions.length };
+  if (rows.length > 0) vacuum += 1;
+  return { chunks: removed, vacuum, sessions: sessions.length };
 }
 
 /**
