@@ -17,8 +17,8 @@ import {
   NAME_PAD_BYTES,
 } from "@/lib/constants";
 import { chunkCountFor } from "@/lib/files";
-import { getSql, type Sql } from "@/lib/db";
-import { SECRET_TABLES, wipeBatch, wipeDue, wipeFile, wipeUpload } from "../../scripts/wipe.mjs";
+import { dbSource, getSql, type Sql } from "@/lib/db";
+import { SECRET_TABLES, wipeBatch, wipeDue, wipeFile } from "../../scripts/wipe.mjs";
 
 export type BatchMeta = {
   id: string;
@@ -140,12 +140,35 @@ function asQuery(sql: Sql): Query {
 
 const secretTables = new Set<string>(SECRET_TABLES);
 let vacuumChain: Promise<void> = Promise.resolve();
+let pgliteUploadQuotaChain: Promise<void> = Promise.resolve();
+
+async function withUploadQuotaLock<T>(sql: Sql, run: (lockedSql: Sql) => Promise<T>): Promise<T> {
+  if (dbSource === "pglite") {
+    const previous = pgliteUploadQuotaChain;
+    let release: () => void = () => undefined;
+    pgliteUploadQuotaChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous.catch(() => undefined);
+    try {
+      return await sql.transaction(run);
+    } finally {
+      release();
+    }
+  }
+
+  return sql.transaction(async (lockedSql) => {
+    // Every new stored byte enters through upload_chunks, so serializing this
+    // table makes the quota check and write one atomic operation across workers.
+    await lockedSql.query("lock table upload_chunks in share row exclusive mode");
+    return run(lockedSql);
+  });
+}
 
 // VACUUM FULL rewrites the table into a new file that contains only live rows.
 // Plain VACUUM leaves the deleted bytes in the free space of the old pages.
-// The rewrite takes an exclusive lock, so it runs only after a real delete,
-// and only one rewrite proceeds at a time. A failure here must not fail the
-// request: the rows are already overwritten and deleted.
+// The rewrite takes an exclusive lock, so only the expiry worker and dev timer
+// call this global purge path. Request handlers never run it.
 async function vacuumTables(sql: Sql, tables: readonly string[]): Promise<void> {
   const unique = [...new Set(tables)].filter((table) => secretTables.has(table));
   if (unique.length === 0) return;
@@ -180,20 +203,15 @@ export async function purgeExpired(): Promise<void> {
 
 export async function destroyFile(id: string): Promise<void> {
   const sql = await getSql();
-  const removed = await wipeFile(asQuery(sql), id);
-  if (removed > 0) await vacuumTables(sql, ["sealed_file_chunks", "sealed_files"]);
+  await wipeFile(asQuery(sql), id);
 }
 
 export async function destroyBatch(id: string): Promise<void> {
   const sql = await getSql();
-  const removed = await wipeBatch(asQuery(sql), id);
-  if (removed > 0) {
-    await vacuumTables(sql, ["sealed_file_chunks", "sealed_files", "sealed_batches"]);
-  }
+  await wipeBatch(asQuery(sql), id);
 }
 
 export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
-  await purgeExpired();
   if (!isHex(id, 32)) return null;
   const sql = await getSql();
 
@@ -207,11 +225,9 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
   const batch = batches[0];
   if (batch) {
     if (isExpired(toIso(batch.expires_at))) {
-      await destroyBatch(id);
       return null;
     }
     if (remainingOf(batch) <= 0 && grantExpired(batch.grant_expires_at)) {
-      await destroyBatch(id);
       return null;
     }
     const counts = await sql<{ n: number }>`
@@ -242,7 +258,6 @@ export async function getBatchMeta(id: string): Promise<BatchMeta | null> {
   const file = legacy[0];
   if (!file) return null;
   if (isExpired(toIso(file.expires_at)) || remainingOf(file) <= 0) {
-    await destroyFile(id);
     return null;
   }
   return {
@@ -262,8 +277,13 @@ export function startUploadSession(): { uploadId: string } {
 
 async function discardUpload(uploadId: string): Promise<void> {
   const sql = await getSql();
-  const removed = await wipeUpload(asQuery(sql), uploadId);
-  if (removed > 0) await vacuumTables(sql, ["upload_chunks"]);
+  // Leave wiping and table rewrites to the expiry worker instead of doing
+  // row-by-row secret deletion in a public request handler.
+  await sql`
+    update upload_chunks
+    set created_at = now() - interval '3 hours'
+    where upload_id = ${uploadId}
+  `;
 }
 
 export async function cancelUpload(uploadId: string): Promise<void> {
@@ -278,7 +298,6 @@ export async function storeChunk(input: {
   iv: string;
   payload: Buffer;
 }): Promise<void> {
-  await purgeExpired();
   if (!isHex(input.uploadId, 32)) throw new Error("Invalid upload.");
   if (!isHex(input.iv, 24)) throw new Error("Encryption metadata is invalid.");
   if (
@@ -299,26 +318,34 @@ export async function storeChunk(input: {
     throw new Error("Chunk is too large.");
   }
   const sql = await getSql();
-  const existing = await sql<{ n: number }>`
-    select count(*)::float8 as n from upload_chunks
-    where upload_id = ${input.uploadId}
-      and not (file_index = ${input.fileIndex} and chunk_index = ${input.chunkIndex})
-  `;
-  if (asNumber(existing[0]?.n) >= MAX_CHUNKS_TOTAL) {
-    await discardUpload(input.uploadId);
-    throw new Error("Invalid chunk.");
+  let discard = false;
+  try {
+    await withUploadQuotaLock(sql, async (lockedSql) => {
+      const existing = await lockedSql<{ n: number }>`
+        select count(*)::float8 as n from upload_chunks
+        where upload_id = ${input.uploadId}
+          and not (file_index = ${input.fileIndex} and chunk_index = ${input.chunkIndex})
+      `;
+      if (asNumber(existing[0]?.n) >= MAX_CHUNKS_TOTAL) {
+        discard = true;
+        throw new Error("Invalid chunk.");
+      }
+      const used = await storedBytes(lockedSql);
+      if (used + input.payload.length > MAX_STORE_BYTES) {
+        discard = true;
+        throw new Error(ROOM_ERROR);
+      }
+      await lockedSql`
+        insert into upload_chunks (upload_id, file_index, chunk_index, payload, iv, payload_bin)
+        values (${input.uploadId}, ${input.fileIndex}, ${input.chunkIndex}, '', ${input.iv}, ${input.payload})
+        on conflict (upload_id, file_index, chunk_index)
+        do update set payload = '', iv = excluded.iv, payload_bin = excluded.payload_bin
+      `;
+    });
+  } catch (err) {
+    if (discard) await discardUpload(input.uploadId);
+    throw err;
   }
-  const used = await storedBytes(sql);
-  if (used + input.payload.length > MAX_STORE_BYTES) {
-    await discardUpload(input.uploadId);
-    throw new Error(ROOM_ERROR);
-  }
-  await sql`
-    insert into upload_chunks (upload_id, file_index, chunk_index, payload, iv, payload_bin)
-    values (${input.uploadId}, ${input.fileIndex}, ${input.chunkIndex}, '', ${input.iv}, ${input.payload})
-    on conflict (upload_id, file_index, chunk_index)
-    do update set payload = '', iv = excluded.iv, payload_bin = excluded.payload_bin
-  `;
 }
 
 export type FinishFile = {
@@ -394,7 +421,6 @@ export function validateFinishInput(input: FinishInput): string | null {
 export async function finishUpload(input: FinishInput): Promise<{ id: string }> {
   const error = validateFinishInput(input);
   if (error) throw new Error(error);
-  await purgeExpired();
   const sql = await getSql();
 
   let uploadBytes = 0;
@@ -537,7 +563,6 @@ function presentFile(file: Pick<
 }
 
 export async function unlockBatch(id: string, verifierHex: string): Promise<UnlockResult> {
-  await purgeExpired();
   if (!isHex(id, 32)) return { ok: false, error: "This file is gone.", status: 404 };
   if (!isHex(verifierHex, 64)) return { ok: false, error: "Incorrect password.", status: 401 };
 
@@ -552,11 +577,9 @@ export async function unlockBatch(id: string, verifierHex: string): Promise<Unlo
   const batch = batches[0];
   if (batch) {
     if (isExpired(toIso(batch.expires_at))) {
-      await destroyBatch(id);
       return { ok: false, error: "This file is gone.", status: 404 };
     }
     if (remainingOf(batch) <= 0 && grantExpired(batch.grant_expires_at)) {
-      await destroyBatch(id);
       return { ok: false, error: "This file is gone.", status: 404 };
     }
     if (batch.failed_attempts >= MAX_FAILED_ATTEMPTS) {
@@ -600,7 +623,6 @@ export async function unlockBatch(id: string, verifierHex: string): Promise<Unlo
     `;
     const claim = claimed[0];
     if (!claim) {
-      await destroyBatch(id);
       return { ok: false, error: "This file is gone.", status: 404 };
     }
     const remainingAfter = Math.max(0, claim.max_downloads - claim.download_count);
@@ -637,7 +659,6 @@ async function unlockLegacyFile(id: string, verifierHex: string): Promise<Unlock
   const row = rows[0];
   if (!row) return { ok: false, error: "This file is gone.", status: 404 };
   if (isExpired(toIso(row.expires_at)) || remainingOf(row) <= 0) {
-    await destroyFile(id);
     return { ok: false, error: "This file is gone.", status: 404 };
   }
   if (row.failed_attempts >= MAX_FAILED_ATTEMPTS) {
@@ -677,7 +698,6 @@ async function unlockLegacyFile(id: string, verifierHex: string): Promise<Unlock
   `;
   const claim = claimed[0];
   if (!claim) {
-    await destroyFile(id);
     return { ok: false, error: "This file is gone.", status: 404 };
   }
   const remainingAfter = Math.max(0, claim.max_downloads - claim.download_count);
@@ -716,7 +736,6 @@ export async function fetchFileChunk(
   fileId: string,
   chunkIndex: number,
 ): Promise<FetchResult> {
-  await purgeExpired();
   if (!isHex(ticket, 32) || !isHex(fileId, 32)) {
     return { ok: false, error: "This file is gone.", status: 404 };
   }
