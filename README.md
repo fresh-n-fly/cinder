@@ -34,10 +34,10 @@ The application itself is this directory. Encrypted file contents live in Postgr
 Limits, as shipped:
 
 - Any file type
-- 100 files and 5 GB in one seal
-- About 5 GB stored at once per connection (IPv4 address or IPv6 /64)
+- 100 files and 8 GB in one seal
+- About 8 GB stored at once per connection (IPv4 address or IPv6 /64)
 - An upload must finish within 12 hours
-- 20 GB combined for everything stored on the service at once, including uploads still in progress
+- 32 GB combined for everything stored on the service at once, including uploads still in progress
 - Password: generated for you, or at least 12 characters that are hard to guess
 - Expiry: up to 30 days, entered as day/month/year in GMT
 
@@ -447,7 +447,7 @@ A dump taken before a seal is cleared still holds that ciphertext. Keep backup r
 
 ### Disk
 
-Plan database disk for the ciphertext. New seals are stored as encrypted chunks (`bytea`), one slice per row, so a download never loads a whole file into memory. Names and types are fixed-size ciphertext, so their length is hidden. The service refuses a new upload when the estimated stored footprint, including row overhead, would pass 20 GB, or when one connection would hold more than about 5 GB. Monitor `pg_database_size('cinder')`.
+Plan database disk for the ciphertext. New seals are stored as encrypted chunks (`bytea`), one slice per row, so a download never loads a whole file into memory. Names and types are fixed-size ciphertext, so their length is hidden. The service refuses a new upload when the estimated stored footprint, including row overhead, would pass 32 GB, or when one connection would hold more than about 8 GB. Finishing a seal briefly keeps a second copy of its chunks (counted toward the 32 GB), and the daily compaction rewrites the chunk table, which needs free space about the size of that table. Keep at least 70 GB free for PostgreSQL. Monitor `pg_database_size('cinder')`.
 
 ## Security notes
 

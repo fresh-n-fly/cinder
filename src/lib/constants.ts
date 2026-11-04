@@ -8,9 +8,9 @@ const MiB = 1024 * 1024;
  * Plaintext cap for one sealed batch. It is also one client's share of the
  * store, so filling the whole service takes several distinct networks.
  */
-export const MAX_BATCH_BYTES = 5 * GiB;
+export const MAX_BATCH_BYTES = 8 * GiB;
 /** Approximate disk cap for everything stored on the service at once. */
-export const MAX_STORE_BYTES = 20 * GiB;
+export const MAX_STORE_BYTES = 32 * GiB;
 export const MAX_BATCH_FILES = 100;
 /**
  * Legacy seals stored one ciphertext blob and are downloaded in slices of this
