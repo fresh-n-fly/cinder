@@ -18,6 +18,8 @@ PREFIX="/opt/cinder"
 DOMAIN=""
 DOMAIN_FROM_CLI=0
 EMAIL=""
+BIND=""
+BIND_FROM_CLI=0
 STATE_FILE="/etc/cinder/install.env"
 NODE_DIST_INDEX="https://nodejs.org/dist/latest-v22.x"
 FAILED_MSG=""
@@ -39,6 +41,10 @@ Options:
   --domain NAME   Public hostname for this server
   --email ADDR    Contact email for a Let's Encrypt certificate
   --prefix DIR    Install directory (default: /opt/cinder)
+  --bind ADDR     Serve Cinder only on this IPv4 address of the host (for
+                  example a LAN address); other sites on 80/443 keep the
+                  rest. "--bind any" goes back to every address. Remembered
+                  for later runs.
   -h, --help      Show this help
 
 With no options the site is served on HTTPS port 443 and HTTP redirects there. If
@@ -81,6 +87,12 @@ while [[ $# -gt 0 ]]; do
     --email)
       [[ $# -ge 2 ]] || die "--email needs an address"
       EMAIL=$2
+      shift 2
+      ;;
+    --bind)
+      [[ $# -ge 2 ]] || die "--bind needs an IPv4 address (or \"any\")"
+      BIND=$2
+      BIND_FROM_CLI=1
       shift 2
       ;;
     --prefix)
@@ -132,6 +144,9 @@ case "$PREFIX" in
 esac
 
 if [[ -f "$STATE_FILE" ]]; then
+  if [[ "$BIND_FROM_CLI" != 1 ]]; then
+    BIND=$(grep -E '^BIND=' "$STATE_FILE" | tail -n 1 | cut -d= -f2- || true)
+  fi
   if [[ -z "$DOMAIN" ]]; then
     DOMAIN=$(grep -E '^DOMAIN=' "$STATE_FILE" | tail -n 1 | cut -d= -f2- || true)
   fi
@@ -141,6 +156,16 @@ if [[ -f "$STATE_FILE" ]]; then
   [[ -z "$DOMAIN" || "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || DOMAIN=""
   [[ -z "$EMAIL" || "$EMAIL" == *@*.* ]] || EMAIL=""
 fi
+
+# Checked after install.env is read, so a remembered address is validated too.
+[[ "$BIND" == "any" ]] && BIND=""
+if [[ -n "$BIND" ]]; then
+  [[ "$BIND" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "--bind must be an IPv4 address such as 192.168.1.10."
+  ip -4 -o addr show | awk '{ split($4, a, "/"); print a[1] }' | grep -qxF "$BIND" \
+    || die "--bind ${BIND}: that address is not assigned to this host."
+fi
+# Where the installer's own checks reach the site.
+CHECK_HOST=${BIND:-127.0.0.1}
 
 SOURCE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 [[ -f "$SOURCE/package.json" && -f "$SOURCE/package-lock.json" ]] || die "Run this script from an unpacked Cinder tree. package.json is not next to deploy/."
@@ -585,6 +610,11 @@ fi
 # Skip container bridges. docker0 and br-* are not addresses other machines use.
 mapfile -t ips < <(ip -4 -o addr show scope global | awk '$2 != "docker0" && $2 !~ /^(br-|veth|docker)/ { split($4, a, "/"); print a[1] }' | sort -u)
 mapfile -t ip6s < <(ip -6 -o addr show scope global 2>/dev/null | awk '$2 != "docker0" && $2 !~ /^(br-|veth|docker)/ { split($4, a, "/"); print a[1] }' | sort -u || true)
+if [[ -n "$BIND" ]]; then
+  # Name and certify only the address Cinder is served on.
+  ips=("$BIND")
+  ip6s=()
+fi
 host_short=$(hostname -s 2>/dev/null || hostname)
 host_fqdn=$(hostname -f 2>/dev/null || true)
 [[ "$host_fqdn" == "$host_short" ]] && host_fqdn=""
@@ -765,19 +795,23 @@ server_names="${names[*]}"
 write_nginx() {
   local mode=$1 default_flag=$2
   local listen80 listen443 listen80_6 listen443_6 http2_line site flag
+  local addr=""
   flag=""
   [[ -n "$default_flag" ]] && flag=" ${default_flag}"
-  listen80="listen 80${flag};"
-  listen443="listen 443 ssl${flag};"
+  # With --bind, listen on that address only. nginx then answers on it with
+  # this site, and other sites keep every other address.
+  [[ -n "$BIND" ]] && addr="${BIND}:"
+  listen80="listen ${addr}80${flag};"
+  listen443="listen ${addr}443 ssl${flag};"
   http2_line=""
   if [[ "$NGINX_HTTP2_ON" == 1 ]]; then
     http2_line="    http2 on;"
   else
-    listen443="listen 443 ssl http2${flag};"
+    listen443="listen ${addr}443 ssl http2${flag};"
   fi
   listen80_6=""
   listen443_6=""
-  if [[ "$WANT_IPV6" == 1 ]]; then
+  if [[ "$WANT_IPV6" == 1 && -z "$BIND" ]]; then
     listen80_6="    listen [::]:80${flag};"
     if [[ "$NGINX_HTTP2_ON" == 1 ]]; then
       listen443_6="    listen [::]:443 ssl${flag};"
@@ -1124,8 +1158,8 @@ page_ok() {
   return 1
 }
 
-page_ok "http://127.0.0.1/" || die "Nginx is up, but HTTP did not redirect to the Cinder page."
-page_ok "https://127.0.0.1/" || die "HTTPS on port 443 is not serving Cinder."
+page_ok "http://${CHECK_HOST}/" || die "Nginx is up, but HTTP did not redirect to the Cinder page."
+page_ok "https://${CHECK_HOST}/" || die "HTTPS on port 443 is not serving Cinder."
 
 le_cert=""
 le_key=""
@@ -1153,7 +1187,7 @@ if [[ -n "$le_cert" && -f "$le_cert" && -f "$le_key" ]]; then
   say "Using the certificate already issued for ${DOMAIN}."
   if apply_nginx letsencrypt; then
     systemctl reload nginx
-    if page_ok "https://127.0.0.1/"; then
+    if page_ok "https://${CHECK_HOST}/"; then
       tls_kind="letsencrypt"
       tls_note="Let's Encrypt certificate for ${DOMAIN}"
       install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
@@ -1180,6 +1214,7 @@ umask 077
 cat > "$STATE_FILE" << EOF
 DOMAIN=${DOMAIN}
 EMAIL=${EMAIL}
+BIND=${BIND}
 EOF
 umask 022
 chmod 644 "$STATE_FILE"
@@ -1206,14 +1241,14 @@ if [[ -n "$pid" && "$pid" != 0 && -r "/proc/${pid}/environ" ]]; then
   [[ "$app_host" == "127.0.0.1" ]] || die "The running process has HOST=${app_host}. It must be 127.0.0.1."
 fi
 
-for url in "http://127.0.0.1/" "https://127.0.0.1/"; do
+for url in "http://${CHECK_HOST}/" "https://${CHECK_HOST}/"; do
   page_ok "$url" || die "Final check failed for ${url}."
 done
 
 say ""
 say "Cinder is up."
 if [[ ${#ips[@]} -eq 0 ]]; then
-  say "  https://127.0.0.1/   ${tls_note}"
+  say "  https://${CHECK_HOST}/   ${tls_note}"
 else
   for ip in "${ips[@]}"; do
     say "  https://${ip}/   ${tls_note}"
