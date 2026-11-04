@@ -385,7 +385,11 @@ END
 \$\$;
 SQL
   if ! as_user postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'cinder'" | grep -q 1; then
-    as_user postgres createdb -O cinder cinder
+    # template0, not template1: after a glibc upgrade (common on Kali and
+    # Debian testing) PostgreSQL refuses to copy template1 until its collation
+    # version is refreshed. template0 is exempt from that check, and this
+    # leaves the existing cluster's databases untouched.
+    as_user postgres createdb -T template0 -O cinder cinder
   fi
   db_url="postgres://cinder:${db_pass}@127.0.0.1:5432/cinder"
   unset db_pass
