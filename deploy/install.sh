@@ -60,6 +60,16 @@ if [[ $EUID -ne 0 ]]; then
   exec sudo bash "$0" "$@"
 fi
 
+# Node is installed under /usr/local. Some distributions leave /usr/local/bin
+# out of sudo's secure_path (Kali: "/usr/sbin:/usr/bin:/sbin:/bin"), so add it
+# here; otherwise this script, npm ci, and the build cannot find node or npm.
+# The installer makes sure everything it relies on there is owned by root.
+case ":${PATH}:" in
+  *:/usr/local/bin:*) ;;
+  *) PATH="/usr/local/sbin:/usr/local/bin:${PATH}" ;;
+esac
+export PATH
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)
