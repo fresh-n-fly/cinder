@@ -34,6 +34,7 @@ async function main() {
     // Wait at most a few seconds for any one row; a busy row is retried on
     // the next run instead of holding this job up.
     await client.query("set lock_timeout = '5s'");
+    const started = Date.now();
     const due = await expireDue({
       query,
       transaction: async (run) => {
@@ -54,17 +55,20 @@ async function main() {
       tables.push("sealed_file_chunks", "sealed_files", "sealed_batches", "unlock_attempts");
     }
     if (due.grants > 0) tables.push("batch_grants");
+    const deletedIn = (Date.now() - started) / 1000;
+    const vacuumStarted = Date.now();
     for (const table of new Set(tables)) {
       if (!SECRET_TABLES.includes(table)) continue;
       await client.query(`VACUUM ${table}`);
     }
+    const vacuumedIn = (Date.now() - vacuumStarted) / 1000;
     const removed = due.batches + due.legacy + due.uploads + due.sessions + due.grants;
     if (due.skipped > 0) {
       console.log(`[expire] skipped ${due.skipped} busy item(s); they are retried on the next run.`);
     }
     if (removed > 0) {
       console.log(
-        `[expire] removed ${due.batches} expired or used-up seal(s), ${due.legacy} legacy file(s), ${due.uploads} abandoned upload chunk(s), ${due.sessions} upload session(s), and ${due.grants} expired ticket(s).`,
+        `[expire] removed ${due.batches} expired or used-up seal(s), ${due.legacy} legacy file(s), ${due.uploads} abandoned upload chunk(s), ${due.sessions} upload session(s), and ${due.grants} expired ticket(s) in ${deletedIn.toFixed(1)}s; VACUUM took ${vacuumedIn.toFixed(1)}s.`,
       );
     }
     return 0;

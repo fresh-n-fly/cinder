@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 /**
- * Overwrite every stored secret with zeros, delete the rows, then VACUUM FULL.
+ * Delete every stored seal and upload. TRUNCATE replaces each Cinder table's
+ * files with empty ones, so the rows leave the table files at once.
  *
- * Stop Cinder before running this. VACUUM FULL takes an exclusive lock and
- * rewrites each table file. The script refuses to start while another client
- * is connected, and it refuses to run without --yes.
+ * Stop Cinder and its timers before running this (deploy/purge.sh does).
+ * TRUNCATE takes exclusive locks. The script refuses to start while another client is connected, and
+ * it refuses to run without --yes.
  *
  * With no DATABASE_URL, Cinder is using the in-memory database. Stopping the
  * process drops those files. This script exits with an error in that case.
  */
 import pg from "pg";
-import { SECRET_TABLES, wipeEverything } from "./wipe.mjs";
+import { wipeEverything } from "./wipe.mjs";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 if (!databaseUrl) {
@@ -49,25 +50,17 @@ async function main() {
       return 3;
     }
 
-    console.log("[purge] Overwriting secrets, then deleting rows.");
+    console.log("[purge] Deleting every stored seal and upload.");
     const counts = await wipeEverything(async (text, params = []) => {
       const result = await client.query(text, params);
       return result.rows;
-    }, (done, total) => {
-      if (done === total || done % 100 === 0) {
-        console.log(`[purge] chunks ${done}/${total}`);
-      }
     });
     console.log(
       `[purge] removed ${counts.chunks} chunk(s), ${counts.files} file(s), ${counts.batches} seal(s), ${counts.uploads} upload chunk(s).`,
     );
 
-    for (const table of SECRET_TABLES) {
-      await client.query(`VACUUM FULL ${table}`);
-      console.log(`[purge] VACUUM FULL ${table}`);
-    }
     console.log(
-      "[purge] Live table files no longer contain those rows. A backup, the write-ahead log, and freed disk blocks can still hold copies. Delete old dumps if this purge has to be final. Full-disk encryption protects freed blocks.",
+      "[purge] The table files no longer contain those rows. A backup, the write-ahead log, and freed disk blocks can still hold copies. Delete old dumps if this purge has to be final. Full-disk encryption protects freed blocks.",
     );
     return 0;
   } finally {
