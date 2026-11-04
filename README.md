@@ -83,6 +83,8 @@ sudo bash deploy/install.sh
 
 The script installs Node.js 22, PostgreSQL, Nginx, and Fail2ban, builds the app, and serves it on HTTPS port 443 while port 80 redirects to HTTPS. Node listens only on `127.0.0.1:3000`. That port is the application. PostgreSQL listens only on `127.0.0.1:5432`.
 
+On a host that already serves other sites on ports 80 and 443, or to keep Cinder to one network, pass `--bind` with one of the host's IPv4 addresses (for example `sudo bash deploy/install.sh --bind 192.168.1.10`). Nginx then serves Cinder only on that address, and other sites keep every other address. The choice is remembered; `--bind any` goes back to every address.
+
 Run the same command again to update Cinder. The database and `/opt/cinder/.env` are kept. The script does not print the database password.
 
 When a DNS name already points at this server and port 80 is reachable from the internet:
