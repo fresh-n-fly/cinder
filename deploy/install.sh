@@ -54,6 +54,13 @@ Pass --domain and --email when a DNS name already points here and port 80
 is reachable from the internet. If Let's Encrypt cannot issue a certificate,
 HTTP still redirects to self-signed HTTPS. When more than one certificate is
 already present, pass --domain to choose it.
+
+Internal hosts (no public name, no public certificate):
+  sudo bash deploy/install.sh --bind 192.168.1.10
+serves Cinder only on that LAN address with a self-signed certificate,
+leaves other Nginx sites on 80/443 alone, backs up /etc/nginx first, and lets
+the unlock jail ban local addresses (private ranges are otherwise exempt).
+The end of the run prints the certificate's fingerprint so users can check it.
 EOF
 }
 
@@ -166,6 +173,21 @@ if [[ -n "$BIND" ]]; then
 fi
 # Where the installer's own checks reach the site.
 CHECK_HOST=${BIND:-127.0.0.1}
+
+# Internal mode: Cinder is served on a private address, so its users are on
+# private networks too. Only an explicit --bind turns this on; a cloud VM
+# with a private address behind public NAT is not internal.
+is_private_v4() {
+  case "$1" in
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;
+  esac
+  return 1
+}
+INTERNAL=0
+if [[ -n "$BIND" ]] && is_private_v4 "$BIND"; then
+  INTERNAL=1
+fi
 
 SOURCE=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 [[ -f "$SOURCE/package.json" && -f "$SOURCE/package-lock.json" ]] || die "Run this script from an unpacked Cinder tree. package.json is not next to deploy/."
@@ -570,8 +592,21 @@ sed \
 cp "$PREFIX/deploy/cinder-compact.timer" /etc/systemd/system/cinder-compact.timer
 
 say "Configuring Fail2ban."
+fail2ban_was_active=$(systemctl is-active fail2ban 2>/dev/null || true)
 install -D -m 644 "$PREFIX/deploy/fail2ban/cinder-unlock.conf" /etc/fail2ban/filter.d/cinder-unlock.conf
 install -D -m 644 "$PREFIX/deploy/fail2ban/cinder.local" /etc/fail2ban/jail.d/cinder.local
+if [[ "$INTERNAL" == 1 ]]; then
+  # Every client of an internal site has a private address, and the stock
+  # list exempts all of those, so the jail would never ban anyone. Exempt
+  # only loopback and this host's own addresses instead.
+  own_addrs=$(ip -o addr show | awk '{ split($4, a, "/"); print a[1] }' | grep -vE '^(127\.|::1$|fe80:)' | sort -u | tr '\n' ' ')
+  internal_ignore="127.0.0.0/8 ::1/128 ${own_addrs% }"
+  sed -i \
+    -e "s|^# Static non-public.*|# Internal install (--bind ${BIND}): local clients can be banned; only loopback and this host are exempt.|" \
+    -e "s|^ignoreip = .*|ignoreip = ${internal_ignore}|" \
+    /etc/fail2ban/jail.d/cinder.local
+  say "The unlock jail can ban addresses on the local network (exempt: loopback and this host)."
+fi
 fail2ban-client -t || die "Fail2ban rejected the Cinder jail configuration."
 
 systemctl daemon-reload
@@ -595,6 +630,13 @@ done
 if [[ "$fail2ban_ready" != 1 ]]; then
   journalctl -u fail2ban -n 40 --no-pager >&2 || true
   die "Fail2ban did not load the cinder-unlock jail."
+fi
+# Starting Fail2ban also starts any jails the distribution enables by default,
+# usually sshd. That changes who can reach SSH, so say so instead of leaving
+# it to be discovered by a locked-out administrator.
+FAIL2BAN_SSHD_NOTE=""
+if [[ "$fail2ban_was_active" != "active" ]] && fail2ban-client status sshd >/dev/null 2>&1; then
+  FAIL2BAN_SSHD_NOTE=1
 fi
 systemctl start cinder-expire.service || die "Could not delete expired seals. Check: journalctl -u cinder-expire.service"
 
@@ -1101,6 +1143,19 @@ enable_site() {
   fi
 }
 
+# On a host with other Nginx sites, keep a copy of the whole configuration
+# before adding Cinder's, so it can be put back exactly.
+NGINX_BACKUP=""
+other_sites=$(find /etc/nginx/sites-enabled /etc/nginx/conf.d -maxdepth 1 \( -type f -o -type l \) \
+  ! -name cinder ! -name cinder.conf ! -name default 2>/dev/null | head -n 1 || true)
+if [[ -n "$other_sites" ]]; then
+  install -d -m 700 /var/backups/cinder
+  NGINX_BACKUP="/var/backups/cinder/nginx-$(date -u +%Y%m%dT%H%M%SZ).tgz"
+  tar -czf "$NGINX_BACKUP" -C / etc/nginx || die "Could not back up /etc/nginx."
+  chmod 600 "$NGINX_BACKUP"
+  say "Other Nginx sites are enabled. Saved the current configuration to ${NGINX_BACKUP}."
+fi
+
 install -d -m 755 /var/www/certbot
 previous_site=$(mktemp)
 if [[ -f /etc/nginx/sites-available/cinder ]]; then
@@ -1260,6 +1315,35 @@ else
 fi
 if [[ "$tls_kind" == "letsencrypt" && -n "$DOMAIN" ]]; then
   say "  https://${DOMAIN}/"
+fi
+if [[ "$tls_kind" == "selfsigned" ]]; then
+  fingerprint=$(openssl x509 -in "$cert" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+  say ""
+  say "No public certificate is in use. The self-signed one is ${cert}"
+  say "  SHA-256 fingerprint: ${fingerprint}"
+  say "Users can compare that fingerprint with the one shown on the browser's warning page."
+  say "To remove the warning, install ${cert} as a trusted certificate on the computers"
+  say "that use Cinder. Browsers may refuse Cinder's download helper while the certificate"
+  say "is untrusted; downloads still work, through temporary browser storage that is"
+  say "cleared on the next visit."
+fi
+if [[ -n "$BIND" ]]; then
+  say ""
+  say "Served only on ${BIND}; other addresses keep their existing sites. Run with --bind any to change that."
+fi
+if [[ -n "$NGINX_BACKUP" ]]; then
+  say "To take Cinder off Nginx again: sudo rm /etc/nginx/sites-enabled/cinder && sudo systemctl reload nginx"
+  say "  (the configuration from before this run is in ${NGINX_BACKUP})"
+fi
+if [[ -n "$FAIL2BAN_SSHD_NOTE" ]]; then
+  say ""
+  say "Note: Fail2ban was not running before, and starting it also turned on the"
+  say "distribution's sshd jail (5 failed logins = 10 minute ban, nobody exempt)."
+  say "To exempt management addresses (for example a VPN range), create"
+  say "/etc/fail2ban/jail.d/sshd-ignore.local containing:"
+  say "  [sshd]"
+  say "  ignoreip = 127.0.0.1/8 ::1 100.64.0.0/10"
+  say "then run: sudo systemctl reload fail2ban"
 fi
 say ""
 say "Node listens on 127.0.0.1:3000. PostgreSQL listens on 127.0.0.1:5432."
