@@ -71,7 +71,7 @@ npm run dev
 
 Open <http://127.0.0.1:3000>. Stop with Ctrl+C.
 
-## Install on Ubuntu or Debian
+## Install on Ubuntu, Debian, or Kali
 
 Unpack the archive on the server and run the installer:
 
@@ -84,6 +84,27 @@ sudo bash deploy/install.sh
 The script installs Node.js 22, PostgreSQL, Nginx, and Fail2ban, builds the app, and serves it on HTTPS port 443 while port 80 redirects to HTTPS. Node listens only on `127.0.0.1:3000`. That port is the application. PostgreSQL listens only on `127.0.0.1:5432`.
 
 On a host that already serves other sites on ports 80 and 443, or to keep Cinder to one network, pass `--bind` with one of the host's IPv4 addresses (for example `sudo bash deploy/install.sh --bind 192.168.1.10`). Nginx then serves Cinder only on that address, and other sites keep every other address. The choice is remembered; `--bind any` goes back to every address.
+
+### Internal hosts without a public certificate
+
+A server on a private network has no public name, so Let's Encrypt cannot issue it a certificate. Install it with its LAN address:
+
+```bash
+sudo bash deploy/install.sh --bind 192.168.1.10
+```
+
+- HTTPS uses a self-signed certificate for that address and the host name, kept in `/etc/nginx/ssl/cinder.crt`. The end of the run prints its SHA-256 fingerprint. Users can compare it with the fingerprint on the browser's warning page, or you can install the certificate as trusted on their computers so there is no warning. While it is untrusted, browsers may refuse Cinder's download helper; downloads still work, through temporary browser storage that is cleared on the next visit.
+- Cinder answers only on that address. Other Nginx sites keep every other address. Before writing its site the installer saves `/etc/nginx` to `/var/backups/cinder/nginx-<time>.tgz` whenever other sites are enabled, and prints how to take Cinder off Nginx again.
+- The `cinder-unlock` jail normally exempts private ranges, which on an internal network would exempt everyone. With `--bind` on a private address it exempts only loopback and the host's own addresses, so repeated wrong passwords from the LAN are banned.
+- If Fail2ban was not running before, starting it also turns on the distribution's own jails, usually `sshd` (5 failed logins, 10 minute ban, nobody exempt). The installer says so at the end. Exempt VPN or management ranges with an `ignoreip` line in `/etc/fail2ban/jail.d/sshd-ignore.local` if that could lock you out.
+- Kali Rolling works. Kali's `sudo` leaves `/usr/local/bin` off the path and its PostgreSQL may report a collation version mismatch after a glibc upgrade; the installer handles both.
+
+To remove Cinder from such a host later:
+
+```bash
+sudo rm /etc/nginx/sites-enabled/cinder && sudo systemctl reload nginx
+sudo systemctl disable --now cinder cinder-expire.timer cinder-compact.timer
+```
 
 Run the same command again to update Cinder. The database and `/opt/cinder/.env` are kept. The script does not print the database password.
 
@@ -101,7 +122,7 @@ If `/etc/letsencrypt/live/` already contains a certificate, the installer uses t
 
 The installer does not open port 3000. If UFW is already on, it allows OpenSSH and Nginx. If UFW is off, it leaves the firewall alone. It does not delete an existing database.
 
-The generated Nginx site rate-limits unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance (any body that is not a chunk-download form counts as an unlock), applies a looser limit to chunk downloads, rate-limits `/api/seal`, every other POST, and every GET (pages, assets, seal lookups), caps each address at 40 requests at once, drops clients that stall, accepts bodies over 64 KB only on `/api/seal`, and refuses any URL whose path contains a percent-escape or a backslash. The API locations match by prefix, so no path suffix moves a request to a looser limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans.
+The generated Nginx site rate-limits unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance (any body that is not a chunk-download form counts as an unlock), applies a looser limit to chunk downloads, rate-limits `/api/seal`, every other POST, and every GET (pages, assets, seal lookups), caps each address at 40 requests at once, drops clients that stall, accepts bodies over 64 KB only on `/api/seal`, and refuses any URL whose path contains a percent-escape or a backslash. The API locations match by prefix, so no path suffix moves a request to a looser limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans, except on an internal install (`--bind` with a private address), where only loopback and the host itself are.
 
 To see or clear those bans:
 
