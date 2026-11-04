@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop Cinder, overwrite and delete every stored file, then start Cinder again.
+# Stop Cinder, delete every stored file, then start Cinder again.
 #
 #   sudo bash deploy/purge.sh --yes
 #
@@ -63,15 +63,27 @@ fi
 [[ -f "${PREFIX}/.env" ]] || die "Missing ${PREFIX}/.env. Run deploy/install.sh first."
 [[ -f "${PREFIX}/scripts/purge.mjs" ]] || die "Missing ${PREFIX}/scripts/purge.mjs."
 
-say "Stopping Cinder."
+# The expiry and compaction jobs connect to the database on their own timers.
+# Stop them too, so the purge has the database to itself.
+# Only timers that were running are started again afterwards; a manual
+# install may not have them at all.
+TIMERS_WERE_ACTIVE=()
+for unit in cinder-expire.timer cinder-compact.timer; do
+  if systemctl is-active --quiet "$unit"; then TIMERS_WERE_ACTIVE+=("$unit"); fi
+done
+say "Stopping Cinder and its scheduled jobs."
 systemctl stop cinder
+for unit in cinder-expire.timer cinder-compact.timer cinder-expire.service cinder-compact.service; do
+  if systemctl cat "$unit" >/dev/null 2>&1; then systemctl stop "$unit"; fi
+done
 
-say "Overwriting and deleting stored files."
+say "Deleting stored files."
 if ! sudo -u cinder bash -lc "set -a; . '${PREFIX}/.env'; set +a; cd '${PREFIX}' && PATH=\"/usr/local/bin:/usr/bin:\$PATH\" node scripts/purge.mjs --yes"; then
-  die "Purge failed. Cinder is still stopped."
+  die "Purge failed. Cinder and its timers are still stopped; start them with: systemctl start cinder ${TIMERS_WERE_ACTIVE[*]:-}"
 fi
 
 say "Starting Cinder."
 systemctl start cinder
+if [[ ${#TIMERS_WERE_ACTIVE[@]} -gt 0 ]]; then systemctl start "${TIMERS_WERE_ACTIVE[@]}"; fi
 systemctl is-active --quiet cinder
 say "Cinder is running. Live table files no longer contain the deleted rows."

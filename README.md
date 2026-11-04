@@ -1,514 +1,213 @@
 # Cinder
 
-Cinder is a private file drop. A visitor locks one or more files with a password in their browser, then gets a link to send. The files are deleted when the expiry date is reached, or after they have been downloaded the allowed number of times.
+Cinder is a private file drop. A visitor locks files with a password in their browser and gets a link to send. The files are deleted at the expiry date, or once they have been downloaded the allowed number of times.
 
-File bytes, file names, and file types are locked in the browser. The password never leaves the sender’s (or recipient’s) browser. The server keeps the locked bytes, fixed-size locked copies of the names and types, and a check value used to confirm the password. Expiry, download limits, and the size of each locked piece stay visible to the operator so files can be deleted on time.
+Files, file names, and file types are encrypted in the browser; the password never leaves it. The server stores ciphertext, a proof hash for checking the password, and the metadata it needs to delete things on time.
 
-This document is the operator’s guide. It covers a local try-out and a production install on Ubuntu 24.04 LTS or Debian 12.
+This is the operator's guide: a local try-out, the installer, a manual install, and day-to-day operation.
 
-## Security + Privacy
+## Security and privacy
 
-Cinder locks the files in the browser and keeps the server from learning the password, the file names, or the file types.
+- **Keys stay in the browser.** The password and a random salt go through Argon2id (64 MiB, 3 passes); HKDF-SHA-256 splits the result into an AES-256-GCM key and a proof under separate labels, so the proof never reveals the key whatever salt the server supplies. The cost settings are fixed in the page. Each 4 MB piece is encrypted before upload. The server keeps only SHA-256 of the proof and compares it in constant time. Seals made with the older PBKDF2 scheme still open until 15 December 2026; for those the page sends only a hash of the proof.
+- **Names and types are encrypted too**, padded to 1,024 and 128 bytes so their length is hidden. Each piece is bound to its position and its file's piece count, and each file to its place and the file count, so pieces or files cannot be swapped, dropped, or cut off without decryption failing.
+- **Before the password is accepted** the page learns only the key-derivation version and salt, the expiry, the download counters, whether the seal is locked, and how many files it holds.
+- **Use is limited.** Seal addresses are 32 random hex characters. Expiry is 15 minutes to 30 days; downloads 1 to 100. For each seal, one connection (an IPv4 address or IPv6 /64) may enter a wrong password 5 times, and 30 wrong passwords in total lock it. A correct password returns a 15-minute download ticket, stored only as a hash, good for about two passes over the seal.
+- **Passwords.** The page starts with a generated 16-character password. A typed one must be at least 12 characters and must not look like a common pattern (a word plus a year or symbol, a keyboard run, repeated characters). There are no operator accounts and no recovery.
+- **Deletion.** About once a minute a job deletes seals that have expired or used up their downloads (after their last ticket ends) and abandoned uploads. Deleted rows stay in PostgreSQL's files until the space is reused; a daily job rewrites the tables to drop them. Backups, the write-ahead log, and freed disk blocks can still hold ciphertext afterwards, so use full-disk encryption.
+- **What a database copy shows:** expiry and download counts, salts, proof hashes, per-piece IVs, the size of each encrypted piece (close to the file size), and keyed hashes of client networks (an HMAC under `CINDER_CLIENT_KEY_SECRET`, never the address).
+- **The host.** Node and PostgreSQL listen on `127.0.0.1` only; Nginx serves 80 and 443. The app tree and `/opt/cinder/.env` are owned by root, so the app cannot change its own code or environment.
 
-**The password never leaves the browser.** The sender’s password and a random salt go through Argon2id (64 MiB of memory, 3 passes). HKDF-SHA-256 then splits the result, under two different labels, into an AES-256-GCM key and a proof the server can check, so the proof never reveals the key, whatever salt the server hands out. The cost settings are fixed in the page, not read from the server. The key encrypts each 4 MB piece of each file before upload. The server stores a SHA-256 of the proof and compares it with a constant-time check. Seals made before this scheme used PBKDF2-SHA-256 with separate salts; for those the page sends only a hash of the proof, and it stops accepting that older scheme on 15 December 2026, after every such seal has expired. A correct proof returns the encryption salt and a 15-minute download ticket. Every unlock gets its own ticket; the server stores only a SHA-256 of it, and a ticket allows about two passes over the seal before it stops working. The password itself is not sent, stored, or recoverable. There is no operator account and no password reset. The page starts with a generated 16-character password. A typed one must be at least 12 characters and must not look like a common pattern (a dictionary word with a year or a symbol, a keyboard run, a repeated character).
+## Limits
 
-**Names and types are locked too.** Each file name is padded to 1,024 bytes and each type to 128 bytes before encryption, so the stored length does not reveal how long the original was. Before the password is accepted, the page is told only the key-derivation version and salt, the expiry, the download counters, whether the seal is locked, and how many files it holds. After a correct password, the browser decrypts the names and the file pieces. Each piece is bound to its position and to the number of pieces in its file, and each name and type to the file's position and the number of files in the seal. Swapping, dropping, or cutting off pieces or files makes decryption fail instead of producing a shorter file.
-
-**The link is unguessable, and use is limited.** A seal address is 32 random hex characters. The sender chooses an expiry, from 15 minutes up to 30 days, and a download count from 1 to 100. One connection (an IPv4 address, or an IPv6 /64) may get the password wrong five times; thirty wrong passwords in total lock the seal until that expiry, so locking someone else's seal takes several distinct networks. When the expiry passes, or the downloads are used up and the last download ticket has ended, a job running about once a minute overwrites the secret columns and deletes the rows. Once a day a second job rewrites the table files so the deleted rows leave the disk. The same wipe is available by hand with `deploy/purge.sh --yes`.
-
-**The host is kept small.** The installer puts PostgreSQL and the Node app on `127.0.0.1` only. Nginx is the service on ports 80 and 443; port 80 redirects to HTTPS, using an existing Let’s Encrypt certificate or a self-signed certificate. The database password is a new 48-character random value, written to `/opt/cinder/.env` (owner `root`, group `cinder`, mode `640`), and the install script does not print it. The app tree and that file are owned by root, so the app cannot change its own code or environment. Download tickets are sent in the request body, and those responses are marked not to be cached.
-
-**What a database copy still shows.** Expiry, download counts, salts, the proof hash, the per-piece initialization vectors, the byte length of each locked piece, and keyed hashes used for per-connection limits (an HMAC under a secret in `/opt/cinder/.env`, never the address itself). That length is close to the original file size. A backup, the write-ahead log, and freed disk blocks can still hold ciphertext after a row is gone. Full-disk encryption is what covers those leftover blocks.
-
-## What you are installing
-
-| Piece | Role |
+| | |
 | --- | --- |
-| Node.js 22 | Runs the Cinder process |
-| PostgreSQL 14 or newer | Stores locked files and metadata |
-| Nginx | TLS termination and reverse proxy |
-| systemd | Starts Cinder on boot and restarts it if it exits |
+| One seal | 100 files, 8 GB |
+| One connection (IPv4 address or IPv6 /64) | about 8 GB stored at once |
+| Whole service | 32 GB stored at once, including uploads in progress |
+| Upload | must finish within 12 hours |
+| Expiry | 15 minutes to 30 days, entered as day/month/year in GMT |
 
-The application itself is this directory. Encrypted file contents live in PostgreSQL, so the database disk is the storage you need to size and back up.
-
-Limits, as shipped:
-
-- Any file type
-- 100 files and 8 GB in one seal
-- About 8 GB stored at once per connection (IPv4 address or IPv6 /64)
-- An upload must finish within 12 hours
-- 32 GB combined for everything stored on the service at once, including uploads still in progress
-- Password: generated for you, or at least 12 characters that are hard to guess
-- Expiry: up to 30 days, entered as day/month/year in GMT
+The values are in `src/lib/constants.ts`.
 
 ## Requirements
 
-A small virtual machine is enough for light use. Suggested starting point:
+- Ubuntu 24.04, Debian 12, or Kali Rolling, with root or sudo; PostgreSQL 14 or newer
+- 2 CPU, 2 GB RAM, and about 100 GB of disk (32 GB of seals, a temporary second copy while a seal finishes, and room for the daily table rewrite)
+- For a public certificate: a DNS name pointing at the server, with port 80 reachable from the internet
 
-- 2 CPU, 2 GB RAM, 40 GB disk
-- A public IPv4 address
-- A DNS name pointing at that address (needed for HTTPS)
-- Root or sudo access
+## Try it locally
 
-Cinder listens on localhost only. Do not open port 3000 on the firewall.
-
-## Quick look on your own machine
-
-You can run Cinder without PostgreSQL. In that mode it uses an in-memory database that is wiped when the process stops. That is fine for reading the code and clicking through the interface. It is not fine for real files.
+Without `DATABASE_URL`, Cinder uses an in-memory database that is lost when the process stops. Fine for trying it out, not for real files.
 
 ```bash
-# Node.js 22 or newer
-node -v
-
-cp .env.example .env
-# Leave DATABASE_URL commented out, or omit it, for the in-memory database.
-
-npm ci --legacy-peer-deps
-npm run dev
+node -v                      # 22 or newer
+npm ci --legacy-peer-deps    # the lockfile needs this flag; do not run npm install
+npm run dev                  # http://127.0.0.1:3000
 ```
 
-`npm ci` without `--legacy-peer-deps` fails on this lockfile, because `ajv` is pinned at two major versions. Do not run `npm install`; that rewrites `package-lock.json`.
+`npm run dev` listens on every interface, so other machines on your network can reach it.
 
-Open <http://127.0.0.1:3000>. Stop with Ctrl+C.
-
-## Install on Ubuntu, Debian, or Kali
-
-Unpack the archive on the server and run the installer:
+## Install with the installer
 
 ```bash
-tar -xzf cinder-source.tar.gz
-cd cinder
+tar -xzf cinder-source.tar.gz && cd cinder
 sudo bash deploy/install.sh
 ```
 
-The script installs Node.js 22, PostgreSQL, Nginx, and Fail2ban, builds the app, and serves it on HTTPS port 443 while port 80 redirects to HTTPS. Node listens only on `127.0.0.1:3000`. That port is the application. PostgreSQL listens only on `127.0.0.1:5432`.
+It installs Node.js 22, PostgreSQL, Nginx, and Fail2ban, builds Cinder, sets up the systemd units and timers, and serves HTTPS on 443 with port 80 redirecting. It never prints the database password. Run it again to update; the database and `/opt/cinder/.env` are kept.
 
-On a host that already serves other sites on ports 80 and 443, or to keep Cinder to one network, pass `--bind` with one of the host's IPv4 addresses (for example `sudo bash deploy/install.sh --bind 192.168.1.10`). Nginx then serves Cinder only on that address, and other sites keep every other address. The choice is remembered; `--bind any` goes back to every address.
+| Option | Effect |
+| --- | --- |
+| `--domain NAME --email ADDR` | Request a Let's Encrypt certificate. If that fails, HTTPS uses a self-signed certificate. An existing certificate in `/etc/letsencrypt/live/` is used automatically; with more than one there, pass `--domain` to choose. The domain is remembered. |
+| `--bind ADDR` | Serve Cinder only on this IPv4 address; other Nginx sites keep every other address. Remembered for later runs; `--bind any` undoes it. |
+| `--prefix DIR` | Install directory (default `/opt/cinder`). |
 
-### Internal hosts without a public certificate
+If UFW is on, the installer allows OpenSSH and Nginx; otherwise it leaves the firewall alone. Port 3000 is never opened. It disables Nginx's stock `default` site.
 
-A server on a private network has no public name, so Let's Encrypt cannot issue it a certificate. Install it with its LAN address:
+The generated Nginx site allows 10 unlock attempts per minute per IP, 40 requests at once per address, and bodies over 64 KB only on `/api/seal`, and refuses paths containing a percent-escape or backslash. The `cinder-unlock` Fail2ban jail bans an address for 30 minutes after 10 wrong passwords in 10 minutes.
+
+### Internal hosts (no public certificate)
 
 ```bash
 sudo bash deploy/install.sh --bind 192.168.1.10
 ```
 
-- HTTPS uses a self-signed certificate for that address and the host name, kept in `/etc/nginx/ssl/cinder.crt`. The end of the run prints its SHA-256 fingerprint. Users can compare it with the fingerprint on the browser's warning page, or you can install the certificate as trusted on their computers so there is no warning. While it is untrusted, browsers may refuse Cinder's download helper; downloads still work, through temporary browser storage that is cleared on the next visit.
-- Cinder answers only on that address. Other Nginx sites keep every other address. Before writing its site the installer saves `/etc/nginx` to `/var/backups/cinder/nginx-<time>.tgz` whenever other sites are enabled, and prints how to take Cinder off Nginx again.
-- The `cinder-unlock` jail normally exempts private ranges, which on an internal network would exempt everyone. With `--bind` on a private address it exempts only loopback and the host's own addresses, so repeated wrong passwords from the LAN are banned.
-- If Fail2ban was not running before, starting it also turns on the distribution's own jails, usually `sshd` (5 failed logins, 10 minute ban, nobody exempt). The installer says so at the end. Exempt VPN or management ranges with an `ignoreip` line in `/etc/fail2ban/jail.d/sshd-ignore.local` if that could lock you out.
-- Kali Rolling works. Kali's `sudo` leaves `/usr/local/bin` off the path and its PostgreSQL may report a collation version mismatch after a glibc upgrade; the installer handles both.
+- HTTPS uses a self-signed certificate (`/etc/nginx/ssl/cinder.crt`). The installer prints its SHA-256 fingerprint for users to check against the browser warning; installing it as trusted removes the warning. While it is untrusted, browsers may refuse Cinder's download helper, and downloads go through temporary browser storage that is cleared on the next visit.
+- If other Nginx sites exist, `/etc/nginx` is first saved to `/var/backups/cinder/nginx-<time>.tgz`.
+- The unlock jail exempts only loopback and the host's own addresses, so repeated wrong passwords from the LAN are banned. (On public installs private ranges are exempt.)
+- If Fail2ban was not running before, starting it also enables the distribution's `sshd` jail (5 failures, 10-minute ban, nobody exempt). The installer warns; exempt VPN or management ranges with an `ignoreip` line in `/etc/fail2ban/jail.d/sshd-ignore.local`.
 
-To remove Cinder from such a host later:
+Do not use `--bind` with a private address on a cloud VM behind a load balancer: every visitor would appear as the balancer, and one guesser could get it banned.
+
+### Remove Cinder
 
 ```bash
-sudo rm /etc/nginx/sites-enabled/cinder && sudo systemctl reload nginx
+sudo bash deploy/purge.sh --yes          # delete stored files first (or: sudo -u postgres dropdb cinder)
+sudo rm /etc/nginx/sites-enabled/cinder && sudo systemctl reload nginx   # conf.d hosts: /etc/nginx/conf.d/cinder.conf
 sudo systemctl disable --now cinder cinder-expire.timer cinder-compact.timer
 ```
 
-Run the same command again to update Cinder. The database and `/opt/cinder/.env` are kept. The script does not print the database password.
+## Manual install
 
-When a DNS name already points at this server and port 80 is reachable from the internet:
+`deploy/install.sh` is the reference; these are the same steps by hand on Ubuntu or Debian. Replace `files.example.com` with your hostname.
 
-```bash
-sudo bash deploy/install.sh --domain files.example.com --email you@example.com
-```
+1. **Packages and user**
 
-Let’s Encrypt is tried once. If it cannot issue a certificate, HTTP still redirects to HTTPS with a self-signed certificate. Browsers warn about that certificate until it is trusted. A private IP address cannot get a public certificate.
+   ```bash
+   sudo apt update && sudo apt install -y ca-certificates curl postgresql nginx fail2ban python3-systemd certbot python3-certbot-nginx ufw
+   sudo adduser --system --group --home /opt/cinder cinder
+   ```
 
-If `/etc/letsencrypt/live/` already contains a certificate, the installer uses that certificate and the domain name of its directory. `--domain` is not required in that case. When more than one certificate is there, pass `--domain` to choose it. A domain saved from an earlier run is kept when its certificate is still present.
+2. **Node.js 22** at `/usr/bin/node` (the units expect that path), for example from NodeSource: download `https://deb.nodesource.com/setup_22.x`, read it, run it with `sudo bash`, then `sudo apt install -y nodejs`.
 
-`--prefix /opt/cinder` changes the install directory. The default is `/opt/cinder`.
+3. **Database**
 
-The installer does not open port 3000. If UFW is already on, it allows OpenSSH and Nginx. If UFW is off, it leaves the firewall alone. It does not delete an existing database.
+   ```bash
+   sudo -u postgres psql <<'SQL'
+   CREATE USER cinder WITH PASSWORD 'choose-a-long-password';
+   CREATE DATABASE cinder OWNER cinder TEMPLATE template0;
+   REVOKE ALL ON DATABASE cinder FROM PUBLIC;
+   SQL
+   sudo -u postgres psql -d cinder -c 'REVOKE ALL ON SCHEMA public FROM PUBLIC; GRANT ALL ON SCHEMA public TO cinder;'
+   ```
 
-The generated Nginx site rate-limits unlock attempts on `/api/open` to 10 requests per minute per IP with a short burst allowance (any body that is not a chunk-download form counts as an unlock), applies a looser limit to chunk downloads, rate-limits `/api/seal`, every other POST, and every GET (pages, assets, seal lookups), caps each address at 40 requests at once, drops clients that stall, accepts bodies over 64 KB only on `/api/seal`, and refuses any URL whose path contains a percent-escape or a backslash. The API locations match by prefix, so no path suffix moves a request to a looser limit. The installer also enables a `cinder-unlock` Fail2ban jail that bans an IP for 30 minutes after 10 logged wrong-password attempts in 10 minutes. Static non-public and special-use IPv4/IPv6 ranges are excluded from bans, except on an internal install (`--bind` with a private address), where only loopback and the host itself are.
+4. **Code and environment.** Unpack to `/opt/cinder`. Create the environment file with safe permissions before putting the password in it (`sudo install -m 640 -o root -g cinder /dev/null /opt/cinder/.env`), then fill it in:
 
-To see or clear those bans:
+   ```
+   NODE_ENV=production
+   HOST=127.0.0.1
+   PORT=3000
+   NITRO_HOST=127.0.0.1
+   NITRO_PORT=3000
+   DATABASE_URL=postgres://cinder:choose-a-long-password@127.0.0.1:5432/cinder
+   CINDER_CLIENT_KEY_SECRET=<output of: openssl rand -hex 32>
+   ```
 
-```bash
-sudo bash deploy/fail2ban-status.sh
-sudo bash deploy/fail2ban-flush.sh --yes
-```
+5. **Build** (this also applies the migrations), then give the tree back to root:
 
-The steps below are the same install, run by hand.
+   ```bash
+   cd /opt/cinder && sudo chown -R cinder:cinder /opt/cinder
+   sudo -u cinder env PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --legacy-peer-deps
+   sudo -u cinder bash -c 'set -a; . /opt/cinder/.env; set +a; npm run build'
+   sudo chown -R root:root /opt/cinder && sudo chmod -R go-w /opt/cinder
+   sudo chown root:cinder /opt/cinder/.env && sudo chmod 640 /opt/cinder/.env
+   ```
 
-## Manual production install (Ubuntu 24.04 LTS or Debian 12)
+   If the build says `DATABASE_URL` is not set, the environment was not loaded; fix that before going on.
 
-The steps below assume a fresh server. Commands are the same on both distributions unless noted.
+6. **Services.** The expiry timer is what deletes seals; do not skip it.
 
-Replace `files.example.com` with your hostname throughout.
+   ```bash
+   sudo cp deploy/cinder.service deploy/cinder-expire.* deploy/cinder-compact.* /etc/systemd/system/
+   sudo cp deploy/fail2ban/cinder-unlock.conf /etc/fail2ban/filter.d/
+   sudo cp deploy/fail2ban/cinder.local /etc/fail2ban/jail.d/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now cinder cinder-expire.timer cinder-compact.timer fail2ban
+   sudo systemctl restart fail2ban && sudo fail2ban-client status cinder-unlock
+   curl -I http://127.0.0.1:3000/    # expect 200
+   ```
 
-### 1. Update the system
+7. **Nginx and TLS.** Get the certificate first (`sudo certbot certonly --nginx -d files.example.com`; this leaves the site files alone). Then copy `deploy/nginx.conf` to `/etc/nginx/sites-available/cinder`, replace `files.example.com`, link it into `sites-enabled`, remove `sites-enabled/default`, and run `sudo nginx -t && sudo systemctl reload nginx`. Keep `client_max_body_size 8m` in the `/api/seal` location; uploads arrive in 4 MB pieces.
 
-```bash
-sudo apt update
-sudo apt upgrade -y
-sudo apt install -y ca-certificates curl gnupg ufw git unzip fail2ban python3-systemd
-```
+8. **Firewall:** allow OpenSSH and Nginx (`sudo ufw allow OpenSSH && sudo ufw allow 'Nginx Full' && sudo ufw enable`). Never open port 3000.
 
-### 2. Create a dedicated user
+To update a manual install, unpack the new version over `/opt/cinder` and repeat step 5, then `sudo systemctl restart cinder`.
 
-Cinder should not run as root.
+## Operation
 
-```bash
-sudo adduser --system --group --home /opt/cinder cinder
-sudo mkdir -p /opt/cinder
-sudo chown cinder:cinder /opt/cinder
-```
+| Task | Command |
+| --- | --- |
+| Stop / start | `sudo systemctl stop cinder` / `sudo systemctl start cinder` (Nginx keeps serving a gateway error) |
+| Logs | `journalctl -u cinder -f`; expiry and compaction: `journalctl -u cinder-expire.service`, `journalctl -u cinder-compact.service`; Nginx: `/var/log/nginx/cinder.error.log` |
+| Check that due rows are gone | `sudo bash deploy/verify.sh` |
+| Delete everything | `sudo bash deploy/purge.sh --yes` |
+| Run expiry now | `sudo systemctl start cinder-expire.service` |
+| Rewrite tables now | `sudo systemctl start cinder-compact.service` |
+| See or clear Fail2ban bans | `sudo bash deploy/fail2ban-status.sh`, `sudo bash deploy/fail2ban-flush.sh --yes` |
+| Update | unpack the new version and run `sudo bash deploy/install.sh` |
 
-### 3. Install Node.js 22
+With a non-default install directory, pass the same `--prefix DIR` to `verify.sh` and `purge.sh`.
 
-The copies of Node in the default Ubuntu and Debian repositories are often too old. The NodeSource repository tracks current releases.
+**Expiry** runs every minute. It deletes each due seal (expired, or downloads used up and last ticket ended) in a single transaction, deletes abandoned uploads, then runs plain `VACUUM` so the space can be reused. Both steps take time in proportion to the data deleted, because PostgreSQL rewrites every page it removes rows from; each run logs how long they took. Rows that are busy are skipped until the next run.
 
-Inspect the setup script if you prefer, then:
+**Compaction** runs daily between 04:15 and 04:45 UTC (or at boot if a run was missed). `VACUUM FULL` rewrites each table so deleted rows leave its files; it needs free space about the size of the table, and it blocks reads of that table while it runs. A table whose lock is not free within 5 seconds is skipped.
 
-```bash
-curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/nodesource.sh
-# Read /tmp/nodesource.sh, then:
-sudo bash /tmp/nodesource.sh
-sudo apt install -y nodejs
-node -v   # should print v22.x
-npm -v
-```
+**`verify.sh`** lists what is stored, then anything that should already be gone. Exit 0 means the live tables hold nothing due for deletion. Locked seals and seals with a live download ticket are meant to remain.
 
-If NodeSource is not acceptable in your environment, install Node 22 from the official Linux binaries on <https://nodejs.org> and put `node` on the `cinder` user’s `PATH`. The systemd unit below assumes `/usr/bin/node`.
+**`purge.sh --yes`** stops Cinder and its timers, empties every Cinder table with `TRUNCATE` (which replaces their files), and starts everything again. It refuses to run while any other client is connected to the database.
 
-### 4. Install PostgreSQL
+**Backups.** `sudo -u postgres pg_dump -Fc cinder | sudo tee /var/backups/cinder-$(date +%F).dump >/dev/null` is enough to restore (`sudo -u postgres pg_restore --clean --if-exists -d cinder <file>`). Dumps contain ciphertext and keep it after a seal is deleted, so keep their retention within your deletion window.
 
-```bash
-sudo apt install -y postgresql postgresql-contrib
-sudo systemctl enable --now postgresql
-```
-
-Create a database and a role that can use only that database. Pick a long random password and keep it off the shell history if you can (type it in `psql`, or read it from a file).
-
-```bash
-sudo -u postgres psql <<'SQL'
-CREATE USER cinder WITH PASSWORD 'choose-a-long-password';
-CREATE DATABASE cinder OWNER cinder;
-REVOKE ALL ON DATABASE cinder FROM PUBLIC;
-GRANT ALL ON DATABASE cinder TO cinder;
-SQL
-```
-
-On PostgreSQL 15 and 16 you may also want:
-
-```bash
-sudo -u postgres psql -d cinder -c 'REVOKE ALL ON SCHEMA public FROM PUBLIC;'
-sudo -u postgres psql -d cinder -c 'GRANT ALL ON SCHEMA public TO cinder;'
-```
-
-Confirm you can log in:
-
-```bash
-psql "postgres://cinder:choose-a-long-password@127.0.0.1:5432/cinder" -c 'select 1'
-```
-
-### 5. Unpack Cinder
-
-Copy this directory onto the server as `/opt/cinder`. From the machine that holds the archive:
-
-```bash
-# on your laptop
-scp cinder-source.tar.gz user@files.example.com:/tmp/
-
-# on the server
-sudo tar -xzf /tmp/cinder-source.tar.gz -C /opt
-sudo chown -R cinder:cinder /opt/cinder
-```
-
-If you unpacked to a folder named `cinder` in the current directory, move it:
-
-```bash
-sudo mv cinder /opt/cinder
-sudo chown -R cinder:cinder /opt/cinder
-```
-
-### 6. Configure the environment
-
-```bash
-sudo -u cinder cp /opt/cinder/.env.example /opt/cinder/.env
-sudo -u cinder chmod 600 /opt/cinder/.env
-sudo -u cinder nano /opt/cinder/.env
-```
-
-Set at least:
-
-```
-NODE_ENV=production
-HOST=127.0.0.1
-PORT=3000
-NITRO_HOST=127.0.0.1
-NITRO_PORT=3000
-DATABASE_URL=postgres://cinder:choose-a-long-password@127.0.0.1:5432/cinder
-```
-
-`HOST=127.0.0.1` keeps the Node process off the public interface. Set `NITRO_HOST` to the same address. Nitro reads both. Nginx will be the only listener on 80 and 443. Port 3000 is the application, not PostgreSQL.
-
-### 7. Build
-
-```bash
-cd /opt/cinder
-sudo -u cinder env PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --legacy-peer-deps
-sudo -u cinder -E bash -lc 'set -a; . /opt/cinder/.env; set +a; npm run build'
-```
-
-Use `--legacy-peer-deps`, as in the local try-out. Do not run `npm install`. `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` skips a browser download the server does not need.
-
-`npm run build` compiles the site and applies the SQL migrations in `migrations/` to `DATABASE_URL`. It is safe to run again; already-applied files are skipped.
-
-If the build prints that `DATABASE_URL` is not set, the environment file was not loaded. Stop and fix that before continuing. An in-memory database in production would lose every file on restart.
-
-After a successful build you should have `/opt/cinder/.output/server/index.mjs`.
-
-Then hand the tree back to root, so the running app cannot change its own code or environment file:
-
-```bash
-sudo chown -R root:root /opt/cinder
-sudo chmod -R go-w /opt/cinder
-sudo chown root:cinder /opt/cinder/.env
-sudo chmod 640 /opt/cinder/.env
-```
-
-### 8. systemd
-
-```bash
-sudo cp /opt/cinder/deploy/cinder.service /etc/systemd/system/cinder.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now cinder
-sudo systemctl status cinder
-```
-
-Useful checks:
-
-```bash
-curl -I http://127.0.0.1:3000/
-journalctl -u cinder -e
-```
-
-You want HTTP 200 from the curl, and no stack traces in the journal.
-
-### 9. Firewall
-
-```bash
-sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
-sudo ufw enable
-sudo ufw status
-```
-
-Do not allow port 3000. PostgreSQL should listen on localhost only (the default).
-
-### 10. Nginx and TLS
-
-```bash
-sudo apt install -y nginx certbot python3-certbot-nginx
-sudo mkdir -p /var/www/certbot
-```
-
-Copy the example site and put your hostname in it:
-
-```bash
-sudo cp /opt/cinder/deploy/nginx.conf /etc/nginx/sites-available/cinder
-sudo nano /etc/nginx/sites-available/cinder   # replace files.example.com
-sudo ln -sf /etc/nginx/sites-available/cinder /etc/nginx/sites-enabled/cinder
-sudo rm -f /etc/nginx/sites-enabled/default
-```
-
-The example file expects certificates that do not exist yet. For the first certificate, temporarily serve HTTP only, or use certbot’s nginx plugin and let it write the SSL server block.
-
-A reliable first-certificate sequence:
-
-1. In `/etc/nginx/sites-available/cinder`, keep only the `listen 80` server, with `location /` proxying to `http://127.0.0.1:3000` (no redirect yet).
-2. `sudo nginx -t && sudo systemctl reload nginx`
-3. `sudo certbot --nginx -d files.example.com`
-4. Confirm that certbot added a 443 server and a redirect from 80.
-
-`client_max_body_size` must stay at least `8m`. Uploads are split into pieces of about 4 MB; a 1 MB default in Nginx will break them.
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-Visit `https://files.example.com`. The browser should show Cinder, with a valid padlock.
-
-## Day-to-day operation
-
-### Stop the site
-
-```bash
-sudo systemctl stop cinder
-```
-
-The Node process exits. Nginx keeps listening on ports 80 and 443, and visitors see a gateway error until Cinder is started again. To close those ports as well:
-
-```bash
-sudo systemctl stop nginx
-```
-
-Bring Cinder back:
-
-```bash
-sudo systemctl start cinder
-```
-
-If Nginx was stopped:
-
-```bash
-sudo systemctl start nginx
-```
-
-### Check that expired files are gone
-
-```bash
-sudo bash deploy/verify.sh
-```
-
-The script reads the database password from `/opt/cinder/.env` and does not print it. It lists what is still stored, then lists seals past their expiry, used-up seals whose last download ticket has ended, expired tickets, uploads that were abandoned or are older than 12 hours, and chunks left without a file. Exit 0 means those are gone from the live tables. A seal locked by wrong passwords, or one whose 15-minute download ticket is still valid, is supposed to remain.
-
-### Purge every stored file
-
-Stop Cinder first. The purge rewrites the table files, and it refuses to start while Cinder, or any other database client, is still connected.
-
-```bash
-sudo bash deploy/purge.sh --yes
-```
-
-That stops Cinder, runs the wipe, and starts Cinder again. Without `--yes` it refuses and leaves the service running.
-
-The script requires `--yes`. It overwrites each secret column with zeros, deletes the row, then runs `VACUUM FULL` on every Cinder table. `VACUUM FULL` builds a new table file that contains only the rows still present and drops the old file.
-
-Expired seals, seals that have used their downloads, expired tickets, and uploads that were abandoned or are older than 12 hours are cleared on a timer, about once a minute, whether or not anyone opens the site. A used-up seal stays until its last download ticket has ended. Each pass zero-fills and deletes every due row, then runs plain `VACUUM`, which takes no exclusive lock. The installer enables `cinder-expire.timer`; run it by hand with `sudo systemctl start cinder-expire.service`.
-
-Once a day `cinder-compact.timer` runs `VACUUM FULL` on each Cinder table, so deleted rows also leave the table files. Each table waits at most five seconds for its lock and is skipped if busy. Run it by hand with `sudo systemctl start cinder-compact.service`. Until that rewrite, deleted rows can stay in the table files for up to about a day.
-
-Copies can remain in three places after either kind of delete:
-
-- A `pg_dump` taken earlier. Delete those dumps when the purge has to be final.
-- The write-ahead log, until PostgreSQL recycles those segments.
-- Disk blocks the operating system has not reused yet. Full-disk encryption (LUKS), noted under Security notes, protects those blocks.
-
-When `DATABASE_URL` is unset, files live only in the Cinder process. Stop the process (`sudo systemctl stop cinder`, or Ctrl+C on `npm run dev`) and they are gone. The purge script exits with an error in that case, because there is no PostgreSQL database to rewrite.
-
-### Logs
-
-```bash
-journalctl -u cinder -f
-sudo tail -f /var/log/nginx/cinder.error.log
-```
-
-### Restart after a config change
-
-```bash
-sudo systemctl restart cinder
-```
-
-### Update Cinder
-
-Unpack the new archive and run the installer again. It keeps `/opt/cinder/.env` and the database.
-
-```bash
-sudo bash deploy/install.sh
-```
-
-To build by hand instead, from a tree already at `/opt/cinder`:
-
-```bash
-cd /opt/cinder
-sudo chown -R cinder:cinder /opt/cinder
-sudo -u cinder env PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --legacy-peer-deps
-sudo -u cinder -E bash -lc 'set -a; . /opt/cinder/.env; set +a; npm run build'
-sudo chown -R root:root /opt/cinder
-sudo chmod -R go-w /opt/cinder
-sudo chown root:cinder /opt/cinder/.env
-sudo chmod 640 /opt/cinder/.env
-sudo systemctl restart cinder
-```
-
-Migrations run as part of `npm run build`. Do not skip that step.
-
-### Backups
-
-Encrypted files sit in PostgreSQL. A database dump is enough to restore the service. The dump still contains ciphertext; it is not readable without the passwords chosen by senders, but it is still sensitive. Store dumps the way you would store any confidential backup.
-
-```bash
-sudo -u postgres pg_dump -Fc cinder > /var/backups/cinder-$(date +%F).dump
-```
-
-Restore:
-
-```bash
-sudo -u postgres pg_restore --clean --if-exists -d cinder /var/backups/cinder-YYYY-MM-DD.dump
-```
-
-A dump taken before a seal is cleared still holds that ciphertext. Keep backup retention inside the deletion window you want. Clearing itself is described under "Purge every stored file".
-
-### Disk
-
-Plan database disk for the ciphertext. New seals are stored as encrypted chunks (`bytea`), one slice per row, so a download never loads a whole file into memory. Names and types are fixed-size ciphertext, so their length is hidden. The service refuses a new upload when the estimated stored footprint, including row overhead, would pass 32 GB, or when one connection would hold more than about 8 GB. Finishing a seal briefly keeps a second copy of its chunks (counted toward the 32 GB), and the daily compaction rewrites the chunk table, which needs free space about the size of that table. Keep at least 70 GB free for PostgreSQL. Monitor `pg_database_size('cinder')`.
+**Disk.** Monitor `pg_database_size('cinder')`. Uploads are refused once the stored total would pass 32 GB.
 
 ## Security notes
 
-- Use HTTPS. The password never travels to the server. Download tickets do. File names and types do not: they are locked before upload.
-- What stays readable in the database is operational: expiry, download counters, salts, per-chunk initialization vectors, and the byte length of each locked slice. That length is required to store and serve the slice. It is a close stand-in for the original size.
-- Keep `DATABASE_URL` and `CINDER_CLIENT_KEY_SECRET` in `/opt/cinder/.env`, owned by `root` with group `cinder` and mode `640`, and keep the rest of `/opt/cinder` owned by root. If the app user could write either, anything that ran code in the app could make itself permanent. The secret keys the hashes used for per-connection limits; anyone holding it can test whether a given address made an upload or a wrong-password attempt that is still stored.
-- The app log records the client address of each counted wrong password, so Fail2ban can act on it. Set a journald retention (`MaxRetentionSec=`) that matches how long you want addresses kept.
-- Browsers without a save-file picker (Firefox, Safari) receive downloads through a small service worker (`/save-sw.js`), so decrypted files are not written to the site's storage.
+- Keep `DATABASE_URL` and `CINDER_CLIENT_KEY_SECRET` in `/opt/cinder/.env` (`root:cinder`, mode `640`) and the rest of `/opt/cinder` owned by root. Anyone holding the secret can test whether an address made an upload or a wrong-password attempt that is still stored.
+- The app log records the address of each counted wrong password for Fail2ban. The Nginx access log records client addresses with seal paths (`/f/<id>`). Set journald `MaxRetentionSec=` and logrotate retention to how long you want addresses kept.
 - Do not put Cinder behind a cache that stores POST bodies or `/api/open` responses.
-- There are no operator accounts and no way to recover a forgotten password. If a sender loses the password, the files cannot be opened.
-- The in-memory database is only for local trials. Production must set `DATABASE_URL`.
-- Full-disk encryption on the server (LUKS) is worth turning on if the host is a VPS you do not physically control.
+- Full-disk encryption (LUKS) covers ciphertext left in freed blocks, the write-ahead log, and anything else outside the live tables.
 
 ## Troubleshooting
 
-**The installer stopped.**  
-Run `sudo bash deploy/install.sh` again. It keeps the database. The build log is `/var/log/cinder-build.log`.
-
-**`npm run build` skips migrations.**  
-`DATABASE_URL` was empty in that shell. Load `.env` as shown in step 7.
-
-**`cinder.service` fails with `Cannot find module`.**  
-The build did not produce `.output/server/index.mjs`. Run the build again as the `cinder` user from `/opt/cinder`.
-
-**Nginx `413 Request Entity Too Large`.**  
-Raise `client_max_body_size` in the site file (8m or more) and reload Nginx.
-
-**502 Bad Gateway.**  
-Cinder is not listening. `systemctl status cinder` and `journalctl -u cinder -e`. Confirm `HOST` and `PORT` match the upstream in Nginx (`127.0.0.1:3000`).
-
-**Blank page, assets 404.**  
-The process is running from the wrong working directory. The systemd unit sets `WorkingDirectory=/opt/cinder`. Do not start it by hand from another path.
-
-**Files vanish after a reboot.**  
-PostgreSQL is not in use. Set `DATABASE_URL` and rebuild.
-
-**Cannot connect to Postgres.**  
-Check `pg_hba.conf` allows `127.0.0.1` with a password, and that the role owns the database. `journalctl -u postgresql -e`.
+| Problem | Fix |
+| --- | --- |
+| Installer stopped | Run it again; it keeps the database. Build log: `/var/log/cinder-build.log`. |
+| Build skips migrations | `DATABASE_URL` was not loaded; source `.env` as in step 5. |
+| `Cannot find module` on start | The build did not produce `.output/server/index.mjs`; rebuild as `cinder` in `/opt/cinder`. |
+| Nginx 413 | `client_max_body_size` must be at least `8m` for `/api/seal`. |
+| 502 Bad Gateway | Cinder is not running (`systemctl status cinder`, `journalctl -u cinder -e`), or `HOST`/`PORT` in `.env` do not match the Nginx upstream `127.0.0.1:3000`. |
+| Blank page, assets 404 | Cinder was started from the wrong directory; run it through the unit, which sets `WorkingDirectory=/opt/cinder`. |
+| Files gone after a reboot | `DATABASE_URL` is unset, so the in-memory database was used. |
+| Cannot connect to PostgreSQL | Check `pg_hba.conf` allows `127.0.0.1` with a password; `journalctl -u postgresql -e`. |
 
 ## Layout
 
 ```
-.
-├── README.md
-├── package.json
-├── vite.config.ts
-├── .env.example
-├── deploy/
-│   ├── install.sh        # Debian and Ubuntu installer
-│   ├── verify.sh         # check that expired rows are gone
-│   ├── purge.sh          # overwrite and delete every stored file
-│   ├── cinder.service    # systemd unit for the site
-│   ├── cinder-expire.service
-│   ├── cinder-expire.timer  # deletes expired seals every minute
-│   ├── cinder-compact.service
-│   ├── cinder-compact.timer # rewrites table files once a day
-│   └── nginx.conf        # reverse proxy example
-├── migrations/           # PostgreSQL schema
-├── public/               # favicon and share image
-├── scripts/              # database migrator and expiry job
-└── src/                  # application
+deploy/        installer, verify, purge, Fail2ban helpers, systemd units, Nginx example
+migrations/    PostgreSQL schema
+public/        static files and the download service worker
+scripts/       migrations, expiry, compaction, purge
+src/           application
 ```
 
 ## Licence

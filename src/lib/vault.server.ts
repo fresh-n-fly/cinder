@@ -328,14 +328,15 @@ export async function purgeExpired(): Promise<void> {
   if (tables.length > 0) await vacuumTables(sql, tables);
 }
 
+// Each deletion runs in one transaction, so a seal is never seen half deleted.
 export async function destroyFile(id: string): Promise<void> {
   const sql = await getSql();
-  await wipeFile(asQuery(sql), id);
+  await sql.transaction((tx) => wipeFile(asQuery(tx), id));
 }
 
 export async function destroyBatch(id: string): Promise<void> {
   const sql = await getSql();
-  await wipeBatch(asQuery(sql), id);
+  await sql.transaction((tx) => wipeBatch(asQuery(tx), id));
 }
 
 export async function getBatchMeta(id: string): Promise<BatchMeta | null> {

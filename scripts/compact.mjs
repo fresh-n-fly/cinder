@@ -2,7 +2,7 @@
 /**
  * Rewrite Cinder's table files so deleted rows no longer exist on disk.
  *
- * The expiry job zero-fills and deletes rows every minute, then runs plain
+ * The expiry job deletes due rows every minute, then runs plain
  * VACUUM. That frees the space for reuse, but the old row versions can stay in
  * the table file until the space is reused. VACUUM FULL writes a new file
  * that holds only live rows and drops the old one.

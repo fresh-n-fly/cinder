@@ -1,14 +1,14 @@
 /**
- * Replace secret columns with zeros, then delete the row.
+ * Deleting stored seals and uploads.
  *
- * PostgreSQL keeps the previous row version until the table is rewritten.
- * One zero-fill followed by DELETE is the sequence that lets VACUUM FULL
- * (scripts/compact.mjs, on its own schedule) drop the ciphertext from the
- * live table file. A second overwrite does
- * nothing until that rewrite happens. Values larger than 16 MiB are
- * replaced with a single zero: a same-length replacement of a multi-gigabyte
- * legacy blob cannot be allocated in one UPDATE, and the old version is
- * removed by the rewrite rather than by the size of the new value.
+ * Rows are deleted, one statement per table for each seal or upload. They are
+ * not overwritten first: PostgreSQL writes an UPDATE as a new row version and
+ * leaves the old one in place, so zero-filling never removed ciphertext from
+ * disk. It only doubled the write load. After a DELETE the old row versions
+ * stay in the table files until plain VACUUM marks the space reusable and
+ * later writes overwrite it, or until VACUUM FULL (scripts/compact.mjs, daily)
+ * or TRUNCATE (purge) writes new files. Full-disk encryption covers what is
+ * left in freed blocks, the write-ahead log, and backups.
  */
 
 /** @typedef {(text: string, params?: unknown[]) => Promise<Array<Record<string, unknown>>>} Query */
@@ -17,7 +17,6 @@
  * transaction) and explicit transactions.
  * @typedef {{ query: Query, transaction: <T>(run: (query: Query) => Promise<T>) => Promise<T> }} Db
  */
-/** @typedef {(done: number, total: number) => void} Progress */
 
 export const SECRET_TABLES = [
   "sealed_file_chunks",
@@ -29,178 +28,81 @@ export const SECRET_TABLES = [
   "unlock_attempts",
 ];
 
-const ZERO_LIMIT = 16 * 1024 * 1024;
-
 /**
- * @param {string} column
- * @returns {string}
- */
-function zeroText(column) {
-  return `case
-    when ${column} is null then null
-    when octet_length(${column}) > ${ZERO_LIMIT} then '0'
-    else repeat('0', char_length(${column}))
-  end`;
-}
-
-/**
- * @param {string} column
- * @returns {string}
- */
-function zeroBytea(column) {
-  return `case
-    when ${column} is null then null
-    when octet_length(${column}) > ${ZERO_LIMIT} then decode('00', 'hex')
-    else decode(repeat('00', octet_length(${column})), 'hex')
-  end`;
-}
-
-export const SQL = {
-  ZERO_ONE_CHUNK: `
-    update sealed_file_chunks
-    set payload = ${zeroBytea("payload")},
-        iv = ${zeroText("iv")}
-    where file_id = $1 and chunk_index = $2
-    returning 1
-  `,
-  DELETE_ONE_CHUNK: `
-    delete from sealed_file_chunks
-    where file_id = $1 and chunk_index = $2
-    returning 1
-  `,
-  ZERO_FILE: `
-    update sealed_files
-    set original_name = ${zeroText("original_name")},
-        mime_type = ${zeroText("mime_type")},
-        ciphertext = ${zeroText("ciphertext")},
-        salt_enc = ${zeroText("salt_enc")},
-        iv = ${zeroText("iv")},
-        salt_auth = ${zeroText("salt_auth")},
-        auth_hash = ${zeroText("auth_hash")},
-        file_nonce = ${zeroText("file_nonce")},
-        name_iv = ${zeroText("name_iv")},
-        name_ct = ${zeroText("name_ct")},
-        mime_iv = ${zeroText("mime_iv")},
-        mime_ct = ${zeroText("mime_ct")},
-        size_bytes = case when size_bytes is null then null else 0 end,
-        cipher_bytes = 0
-    where id = $1
-    returning 1
-  `,
-  DELETE_FILE: `delete from sealed_files where id = $1 returning 1`,
-  ZERO_BATCH: `
-    update sealed_batches
-    set salt_auth = ${zeroText("salt_auth")},
-        auth_hash = ${zeroText("auth_hash")},
-        salt_enc = ${zeroText("salt_enc")},
-        grant_token = ${zeroText("grant_token")},
-        client_key = ${zeroText("client_key")}
-    where id = $1
-    returning 1
-  `,
-  DELETE_BATCH: `delete from sealed_batches where id = $1 returning 1`,
-  // Grant rows hold only a hash of a short-lived ticket and attempt rows hold a
-  // keyed client hash in the primary key, so they are deleted, not zeroed.
-  DELETE_BATCH_GRANTS: `delete from batch_grants where batch_id = $1 returning 1`,
-  DELETE_BATCH_ATTEMPTS: `delete from unlock_attempts where batch_id = $1 returning 1`,
-  DELETE_EXPIRED_GRANTS: `delete from batch_grants where expires_at <= now() returning 1`,
-  ZERO_ONE_UPLOAD: `
-    update upload_chunks
-    set payload = ${zeroText("payload")},
-        payload_bin = ${zeroBytea("payload_bin")},
-        iv = ${zeroText("iv")}
-    where upload_id = $1 and file_index = $2 and chunk_index = $3
-    returning 1
-  `,
-  DELETE_ONE_UPLOAD: `
-    delete from upload_chunks
-    where upload_id = $1 and file_index = $2 and chunk_index = $3
-    returning 1
-  `,
-  DELETE_UPLOAD_SESSION: `delete from upload_sessions where id = $1 returning 1`,
-  ZERO_UPLOAD_SESSION: `
-    update upload_sessions
-    set client_ip = ${zeroText("client_ip")}
-    where id = $1
-    returning 1
-  `,
-};
-
-/**
+ * Run a DELETE and return how many rows it removed, without sending the rows
+ * back. Every statement here is scoped by an id, except the two cleanups that
+ * select by age: expired tickets and upload chunks with no session.
  * @param {Query} query
- * @param {string} text
+ * @param {string} deleteSql a DELETE statement ending in "returning 1"
  * @param {unknown[]} [params]
  * @returns {Promise<number>}
  */
-async function changed(query, text, params = []) {
-  const rows = await query(text, params);
-  return rows.length;
+async function deleted(query, deleteSql, params = []) {
+  const rows = await query(`with d as (${deleteSql}) select count(*)::int as n from d`, params);
+  return Number(rows[0]?.n ?? 0);
 }
 
+export const SQL = {
+  DELETE_FILE_CHUNKS: `delete from sealed_file_chunks where file_id = $1 returning 1`,
+  DELETE_BATCH_CHUNKS: `delete from sealed_file_chunks
+    where file_id in (select id from sealed_files where batch_id = $1) returning 1`,
+  DELETE_FILE: `delete from sealed_files where id = $1 returning 1`,
+  DELETE_BATCH_FILES: `delete from sealed_files where batch_id = $1 returning 1`,
+  DELETE_BATCH: `delete from sealed_batches where id = $1 returning 1`,
+  DELETE_BATCH_GRANTS: `delete from batch_grants where batch_id = $1 returning 1`,
+  DELETE_BATCH_ATTEMPTS: `delete from unlock_attempts where batch_id = $1 returning 1`,
+  DELETE_EXPIRED_GRANTS: `delete from batch_grants where expires_at <= now() returning 1`,
+  DELETE_UPLOAD_CHUNKS: `delete from upload_chunks where upload_id = $1 returning 1`,
+  DELETE_UPLOAD_SESSION: `delete from upload_sessions where id = $1 returning 1`,
+  DELETE_ORPHAN_UPLOAD_CHUNKS: `delete from upload_chunks c
+    where c.created_at < now() - interval '2 hours'
+      and not exists (select 1 from upload_sessions s where s.id = c.upload_id)
+    returning 1`,
+};
+
 /**
+ * Delete a legacy single-file seal (or one file). Run inside a transaction.
  * @param {Query} query
  * @param {string} fileId
- * @returns {Promise<number>}
+ * @returns {Promise<number>} chunk and file rows removed
  */
 export async function wipeFile(query, fileId) {
-  const chunks = await query(
-    "select chunk_index from sealed_file_chunks where file_id = $1 order by chunk_index",
-    [fileId],
-  );
-  let removed = 0;
-  for (const row of chunks) {
-    await changed(query, SQL.ZERO_ONE_CHUNK, [fileId, row.chunk_index]);
-    removed += await changed(query, SQL.DELETE_ONE_CHUNK, [fileId, row.chunk_index]);
-  }
-  await changed(query, SQL.ZERO_FILE, [fileId]);
-  removed += await changed(query, SQL.DELETE_FILE, [fileId]);
+  let removed = await deleted(query, SQL.DELETE_FILE_CHUNKS, [fileId]);
+  removed += await deleted(query, SQL.DELETE_FILE, [fileId]);
   // Legacy single-file seals use the file id as their seal id.
-  await changed(query, SQL.DELETE_BATCH_ATTEMPTS, [fileId]);
+  await deleted(query, SQL.DELETE_BATCH_ATTEMPTS, [fileId]);
   return removed;
 }
 
 /**
+ * Delete a seal and everything that belongs to it. Run inside a transaction:
+ * the seal disappears all at once, so a reader never sees it half deleted.
  * @param {Query} query
  * @param {string} batchId
- * @returns {Promise<number>}
+ * @returns {Promise<number>} chunk, file, and seal rows removed
  */
 export async function wipeBatch(query, batchId) {
   // Take the seal row first, the same order an unlock uses, so the two never
   // wait on each other's locks in a cycle.
   await query("select 1 from sealed_batches where id = $1 for update", [batchId]);
-  const files = await query("select id from sealed_files where batch_id = $1", [batchId]);
-  let removed = 0;
-  for (const row of files) {
-    removed += await wipeFile(query, String(row.id));
-  }
-  await changed(query, SQL.DELETE_BATCH_GRANTS, [batchId]);
-  await changed(query, SQL.DELETE_BATCH_ATTEMPTS, [batchId]);
-  await changed(query, SQL.ZERO_BATCH, [batchId]);
-  removed += await changed(query, SQL.DELETE_BATCH, [batchId]);
+  // Tickets go first: no download can start against a seal being deleted.
+  await deleted(query, SQL.DELETE_BATCH_GRANTS, [batchId]);
+  let removed = await deleted(query, SQL.DELETE_BATCH_CHUNKS, [batchId]);
+  removed += await deleted(query, SQL.DELETE_BATCH_FILES, [batchId]);
+  await deleted(query, SQL.DELETE_BATCH_ATTEMPTS, [batchId]);
+  removed += await deleted(query, SQL.DELETE_BATCH, [batchId]);
   return removed;
 }
 
 /**
+ * Delete an upload's chunks and its session. Run inside a transaction.
  * @param {Query} query
  * @param {string} uploadId
- * @returns {Promise<number>}
+ * @returns {Promise<number>} chunk rows removed
  */
 export async function wipeUpload(query, uploadId) {
-  const rows = await query(
-    "select file_index, chunk_index from upload_chunks where upload_id = $1 order by file_index, chunk_index",
-    [uploadId],
-  );
-  let removed = 0;
-  for (const row of rows) {
-    await changed(query, SQL.ZERO_ONE_UPLOAD, [uploadId, row.file_index, row.chunk_index]);
-    removed += await changed(query, SQL.DELETE_ONE_UPLOAD, [
-      uploadId,
-      row.file_index,
-      row.chunk_index,
-    ]);
-  }
-  await changed(query, SQL.ZERO_UPLOAD_SESSION, [uploadId]);
-  await changed(query, SQL.DELETE_UPLOAD_SESSION, [uploadId]);
+  const removed = await deleted(query, SQL.DELETE_UPLOAD_CHUNKS, [uploadId]);
+  await deleted(query, SQL.DELETE_UPLOAD_SESSION, [uploadId]);
   return removed;
 }
 
@@ -220,6 +122,11 @@ const DUE_BATCHES = `
   order by b.expires_at
 `;
 
+/**
+ * An upload is due when it was finished or cancelled, when it never received a
+ * chunk within 5 minutes, when it went 2 hours without a chunk, or when it is
+ * older than 12 hours however often it was kept alive.
+ */
 const UPLOAD_IS_DUE = `(
   state <> 'pending'
   or created_at < now() - interval '12 hours'
@@ -235,129 +142,36 @@ const DUE_LEGACY = `
 `;
 
 /**
- * Delete every abandoned upload, expired seal, and used-up seal.
- * A used-up seal stays until its download ticket has ended.
+ * Delete everything. For purge.mjs only: Cinder must be stopped and no other
+ * client connected. TRUNCATE replaces each table's files with empty ones, so
+ * the deleted rows leave the table files at once.
  * @param {Query} query
- * @returns {Promise<{ uploads: number, sessions: number, batches: number, legacy: number, grants: number }>}
- */
-export async function wipeDue(query) {
-  const uploads = await wipeAbandonedUploads(query);
-  const batches = await query(DUE_BATCHES);
-  for (const row of batches) {
-    await wipeBatch(query, String(row.id));
-  }
-  const legacy = await query(DUE_LEGACY);
-  for (const row of legacy) {
-    await wipeFile(query, String(row.id));
-  }
-  const grants = await changed(query, SQL.DELETE_EXPIRED_GRANTS);
-  return { uploads: uploads.chunks, sessions: uploads.sessions, batches: batches.length, legacy: legacy.length, grants };
-}
-
-/**
- * An upload is due when it was finished or cancelled, when it never received a
- * chunk within 5 minutes, when it went 2 hours without a chunk, or when it is
- * older than 12 hours however often it was kept alive.
- * @param {Query} query
- * @returns {Promise<{ chunks: number, sessions: number }>}
- */
-export async function wipeAbandonedUploads(query) {
-  const sessions = await query(
-    `select id from upload_sessions
-     where ${UPLOAD_IS_DUE}
-     order by updated_at
-     for update`,
-  );
-  let removed = 0;
-  for (const row of sessions) {
-    removed += await wipeUpload(query, String(row.id));
-  }
-  const rows = await query(
-    `select c.upload_id, c.file_index, c.chunk_index
-     from upload_chunks c
-     where c.created_at < now() - interval '2 hours'
-       and not exists (select 1 from upload_sessions s where s.id = c.upload_id)
-     order by c.created_at`,
-  );
-  for (const row of rows) {
-    await changed(query, SQL.ZERO_ONE_UPLOAD, [row.upload_id, row.file_index, row.chunk_index]);
-    removed += await changed(query, SQL.DELETE_ONE_UPLOAD, [
-      row.upload_id,
-      row.file_index,
-      row.chunk_index,
-    ]);
-  }
-  return { chunks: removed, sessions: sessions.length };
-}
-
-/**
- * @param {Query} query
- * @param {Progress} [onProgress]
  * @returns {Promise<{ chunks: number, files: number, batches: number, uploads: number }>}
  */
-export async function wipeEverything(query, onProgress) {
-  const chunks = await query(
-    "select file_id, chunk_index from sealed_file_chunks order by file_id, chunk_index",
-  );
-  let chunkCount = 0;
-  let seen = 0;
-  for (const row of chunks) {
-    await changed(query, SQL.ZERO_ONE_CHUNK, [row.file_id, row.chunk_index]);
-    chunkCount += await changed(query, SQL.DELETE_ONE_CHUNK, [row.file_id, row.chunk_index]);
-    seen += 1;
-    if (onProgress) onProgress(seen, chunks.length);
-  }
-
-  const files = await query("select id from sealed_files");
-  let fileCount = 0;
-  for (const row of files) {
-    await changed(query, SQL.ZERO_FILE, [row.id]);
-    fileCount += await changed(query, SQL.DELETE_FILE, [row.id]);
-  }
-
-  const batches = await query("select id from sealed_batches");
-  let batchCount = 0;
-  for (const row of batches) {
-    await changed(query, SQL.ZERO_BATCH, [row.id]);
-    batchCount += await changed(query, SQL.DELETE_BATCH, [row.id]);
-  }
-
-  const uploads = await query(
-    "select upload_id, file_index, chunk_index from upload_chunks order by upload_id, file_index, chunk_index",
-  );
-  let uploadCount = 0;
-  for (const row of uploads) {
-    await changed(query, SQL.ZERO_ONE_UPLOAD, [row.upload_id, row.file_index, row.chunk_index]);
-    uploadCount += await changed(query, SQL.DELETE_ONE_UPLOAD, [
-      row.upload_id,
-      row.file_index,
-      row.chunk_index,
-    ]);
-  }
-
-  const sessions = await query("select id from upload_sessions");
-  for (const row of sessions) {
-    await changed(query, SQL.ZERO_UPLOAD_SESSION, [row.id]);
-    await changed(query, SQL.DELETE_UPLOAD_SESSION, [row.id]);
-  }
-
-  await query("delete from batch_grants");
-  await query("delete from unlock_attempts");
-
-  return { chunks: chunkCount, files: fileCount, batches: batchCount, uploads: uploadCount };
+export async function wipeEverything(query) {
+  const count = async (/** @type {string} */ table) =>
+    Number((await query(`select count(*)::int as n from ${table}`))[0]?.n ?? 0);
+  const counts = {
+    chunks: await count("sealed_file_chunks"),
+    files: await count("sealed_files"),
+    batches: await count("sealed_batches"),
+    uploads: await count("upload_chunks"),
+  };
+  await query(`truncate table ${SECRET_TABLES.join(", ")}`);
+  return counts;
 }
 
 /**
- * The scheduled expiry pass. Unlike wipeDue it never holds one long
- * transaction: each upload piece is wiped in its own short transaction, and
- * each seal in its own. No table lock is taken, so uploads, unlocks, and
- * downloads keep running however much there is to delete. Deleting only ever
- * lowers usage, so the upload quota needs no lock against it.
+ * The scheduled expiry pass. Each upload and each seal is deleted in its own
+ * short transaction, with one statement per table. No table lock is taken, so
+ * uploads, unlocks, and downloads keep running however much there is to
+ * delete. Deleting only ever lowers usage, so the upload quota needs no lock
+ * against it.
  *
- * Every item is re-checked under its row lock before it is wiped, so a seal or
- * upload that became active again after the scan is left alone. An item whose
- * row is busy (lock timeout, deadlock, statement timeout) is skipped and left
- * for the next run, so one busy row never holds up the rest.
+ * Every item is re-checked under its row lock before it is deleted, so a seal
+ * or upload that became active again after the scan is left alone. An item
+ * whose row is busy (lock timeout, deadlock, statement timeout) is skipped and
+ * left for the next run, so one busy row never holds up the rest.
  * @param {Db} db
  * @returns {Promise<{ uploads: number, sessions: number, batches: number, legacy: number, grants: number, skipped: number }>}
  */
@@ -381,52 +195,25 @@ export async function expireDue(db) {
       throw err;
     }
   };
-  const dueSessions = await db.query(`select id from upload_sessions where ${UPLOAD_IS_DUE} order by updated_at`);
-  for (const row of dueSessions) {
+
+  for (const row of await db.query(`select id from upload_sessions where ${UPLOAD_IS_DUE} order by updated_at`)) {
     const id = String(row.id);
-    sessions += await unlessBusy(async () => {
-      // Close the upload first. A chunk or finish request that is already
-      // running holds this row, so this waits for it and then re-checks.
-      const closed = await db.query(
-        `update upload_sessions
-         set state = case when state = 'pending' then 'cancelled' else state end
-         where id = $1 and ${UPLOAD_IS_DUE}
-         returning id`,
-        [id],
-      );
-      if (closed.length === 0) return 0;
-      const pieces = await db.query(
-        "select file_index, chunk_index from upload_chunks where upload_id = $1 order by file_index, chunk_index",
-        [id],
-      );
-      for (const piece of pieces) {
-        chunks += await db.transaction(async (query) => {
-          await changed(query, SQL.ZERO_ONE_UPLOAD, [id, piece.file_index, piece.chunk_index]);
-          return changed(query, SQL.DELETE_ONE_UPLOAD, [id, piece.file_index, piece.chunk_index]);
-        });
-      }
-      await db.transaction(async (query) => {
-        await changed(query, SQL.ZERO_UPLOAD_SESSION, [id]);
-        await changed(query, SQL.DELETE_UPLOAD_SESSION, [id]);
-      });
-      return 1;
-    });
-  }
-  const orphans = await db.query(
-    `select c.upload_id, c.file_index, c.chunk_index
-     from upload_chunks c
-     where c.created_at < now() - interval '2 hours'
-       and not exists (select 1 from upload_sessions s where s.id = c.upload_id)
-     order by c.created_at`,
-  );
-  for (const row of orphans) {
-    chunks += await unlessBusy(() =>
+    // Counted only after the transaction commits: 1 for the session plus its chunks.
+    const removed = await unlessBusy(() =>
       db.transaction(async (query) => {
-        await changed(query, SQL.ZERO_ONE_UPLOAD, [row.upload_id, row.file_index, row.chunk_index]);
-        return changed(query, SQL.DELETE_ONE_UPLOAD, [row.upload_id, row.file_index, row.chunk_index]);
+        // A chunk or finish request that is already running holds this row,
+        // so this waits for it and then re-checks that the upload is due.
+        const still = await query(`select id from upload_sessions where id = $1 and ${UPLOAD_IS_DUE} for update`, [id]);
+        if (still.length === 0) return 0;
+        return 1 + (await wipeUpload(query, id));
       }),
     );
+    if (removed > 0) {
+      sessions += 1;
+      chunks += removed - 1;
+    }
   }
+  chunks += await unlessBusy(() => deleted(db.query, SQL.DELETE_ORPHAN_UPLOAD_CHUNKS));
 
   let batches = 0;
   for (const row of await db.query(DUE_BATCHES)) {
@@ -459,6 +246,6 @@ export async function expireDue(db) {
     );
   }
 
-  const grants = await unlessBusy(() => changed(db.query, SQL.DELETE_EXPIRED_GRANTS));
+  const grants = await unlessBusy(() => deleted(db.query, SQL.DELETE_EXPIRED_GRANTS));
   return { uploads: chunks, sessions, batches, legacy, grants, skipped };
 }
